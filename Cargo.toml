@@ -1,0 +1,12 @@
+[package]
+name = "archer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6.6", features = ["derive"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "3.0.4", features = ["full", "visit"] }
+walkdir = "2"
