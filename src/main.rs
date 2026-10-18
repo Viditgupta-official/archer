@@ -5,15 +5,28 @@ use std::path::PathBuf;
 mod analyzer;
 
 #[derive(Debug, Parser)]
-#[command(name = "archer", version, about = "ARCHER — Actix-Web authorization drift prototype")]
+#[command(
+    name = "archer",
+    version,
+    about = "ARCHER — Actix-Web authorization drift prototype"
+)]
 struct Cli {
     /// Rust/Actix-Web repository to analyze
     path: PathBuf,
+
+    /// Emit the report as JSON for programmatic consumers
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let report = analyzer::analyze_repository(&cli.path)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     println!("ARCHER authorization analysis");
     println!("Repository: {}", cli.path.display());
@@ -28,13 +41,31 @@ fn main() -> Result<()> {
     println!();
 
     for route in &report.routes {
-        println!(
-            "{:<7} {:<28} auth={:<12} line={}",
-            route.method,
-            route.path,
-            route.authorization,
-            route.line
-        );
+        println!("{} {}", route.method, route.path);
+        if route.authorization.is_empty() {
+            println!("  authorization:");
+            println!("    ✗ No recognized authorization evidence");
+        } else {
+            println!("  authorization:");
+            for evidence in &route.authorization {
+                println!("    ✓ {:?}", evidence.kind);
+                println!("      mechanism: {}", evidence.mechanism);
+                println!(
+                    "      symbol: {}",
+                    evidence.symbol.as_deref().unwrap_or("<none>")
+                );
+                println!(
+                    "      location: {}:{}",
+                    evidence.file.display(),
+                    evidence.line
+                );
+                println!(
+                    "      handler: {}",
+                    evidence.handler.as_deref().unwrap_or("<none>")
+                );
+                println!("      strength: {:?}", evidence.strength);
+            }
+        }
     }
 
     if !report.findings.is_empty() {
