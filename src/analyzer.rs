@@ -455,12 +455,10 @@ impl AuthEvidenceVisitor {
 impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         let symbol = node.func.to_token_stream().to_string().replace(' ', "");
-        if let Some(evidence) = evidence_for_handler_symbol(
-            &symbol,
-            node.func.span().start().line,
-            &self.file,
-            &self.handler,
-        ) {
+        let line = node.func.span().start().line;
+        let evidence = evidence_for_handler_call(&symbol, line, &self.file, &self.handler)
+            .or_else(|| evidence_for_handler_symbol(&symbol, line, &self.file, &self.handler));
+        if let Some(evidence) = evidence {
             self.evidence.push(evidence);
         }
         for argument in &node.args {
@@ -521,6 +519,73 @@ fn evidence_for_handler_method(
         kind,
         mechanism: method.into(),
         symbol: Some(method.into()),
+        file: file.to_path_buf(),
+        line,
+        handler: Some(handler.into()),
+        strength,
+    })
+}
+
+fn evidence_for_handler_call(
+    symbol: &str,
+    line: usize,
+    file: &Path,
+    handler: &str,
+) -> Option<AuthEvidence> {
+    let name = symbol.rsplit("::").next().unwrap_or(symbol);
+    let lower = name.to_ascii_lowercase();
+    if ["error", "exception", "fault"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || ["_title", "_name", "_status", "_id", "_count", "_description"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+        || (lower.starts_with("author")
+            && !lower.starts_with("authoriz")
+            && !lower.starts_with("authoris"))
+        || lower.starts_with("authority")
+    {
+        return None;
+    }
+
+    let tokens: Vec<&str> = lower.split('_').collect();
+    let has_token = |candidates: &[&str]| tokens.iter().any(|token| candidates.contains(token));
+    let uses_check_prefix = ["require_", "check_", "verify_", "assert_", "ensure_"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+
+    let (kind, strength) = if lower == "require_auth"
+        || lower == "is_authenticated"
+        || lower == "require_authenticated_user"
+        || lower == "current_user"
+        || lower == "authenticated_user"
+    {
+        (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
+    } else if ["authorize", "authorise", "is_authorized", "permit"].contains(&lower.as_str()) {
+        (
+            AuthEvidenceKind::ManualAuthorizationCheck,
+            AuthStrength::Strong,
+        )
+    } else if ["has_role", "has_any_role", "is_admin", "require_admin", "require_manager"]
+        .contains(&lower.as_str())
+        || (uses_check_prefix && has_token(&["admin", "manager", "role"]))
+    {
+        (AuthEvidenceKind::RoleCheck, AuthStrength::Strong)
+    } else if ["has_permission", "check_permission", "verify_permission"]
+        .contains(&lower.as_str())
+        || (uses_check_prefix && has_token(&["permission", "access"]))
+    {
+        (AuthEvidenceKind::PermissionCheck, AuthStrength::Strong)
+    } else if uses_check_prefix && has_token(&["owner", "ownership"]) {
+        (AuthEvidenceKind::OwnershipCheck, AuthStrength::Medium)
+    } else {
+        return None;
+    };
+
+    Some(AuthEvidence {
+        kind,
+        mechanism: name.into(),
+        symbol: Some(symbol.into()),
         file: file.to_path_buf(),
         line,
         handler: Some(handler.into()),
@@ -1402,6 +1467,49 @@ mod tests {
         assert_eq!(evidence.line, 1);
         assert_eq!(evidence.handler.as_deref(), Some("admin"));
         assert_eq!(evidence.strength, AuthStrength::Strong);
+    }
+
+    #[test]
+    fn function_call_evidence_recognizes_checks_without_promoting_identity_or_names() {
+        let syntax: syn::File = syn::parse_str(
+            "fn protected() {
+                check_permission();
+                verify_finance_permission();
+                require_manager();
+                check_resource_owner();
+                require_authenticated_user();
+                admin_dashboard_title();
+                let _ = AuthError::Unauthorized;
+            }",
+        )
+        .unwrap();
+        let handlers = collect_authorized_handlers(Path::new("calls.rs"), &syntax);
+        let evidence = &handlers["protected"];
+
+        assert_eq!(evidence.len(), 5);
+        assert_eq!(evidence[0].kind, AuthEvidenceKind::PermissionCheck);
+        assert_eq!(evidence[0].mechanism, "check_permission");
+        assert_eq!(evidence[0].symbol.as_deref(), Some("check_permission"));
+        assert_eq!(evidence[1].kind, AuthEvidenceKind::PermissionCheck);
+        assert_eq!(evidence[1].mechanism, "verify_finance_permission");
+        assert_eq!(evidence[2].kind, AuthEvidenceKind::RoleCheck);
+        assert_eq!(evidence[2].mechanism, "require_manager");
+        assert_eq!(evidence[3].kind, AuthEvidenceKind::OwnershipCheck);
+        assert_eq!(evidence[3].mechanism, "check_resource_owner");
+        assert_eq!(evidence[4].kind, AuthEvidenceKind::IdentityExtraction);
+        assert_eq!(evidence[4].mechanism, "require_authenticated_user");
+        assert!(evidence.iter().all(|item| item.handler.as_deref() == Some("protected")));
+        assert!(!evidence.iter().any(|item| item.mechanism == "admin_dashboard_title"));
+        assert!(!evidence.iter().any(|item| item.kind == AuthEvidenceKind::IdentityExtraction && item.is_authorization()));
+
+        let error_syntax: syn::File = syn::parse_str(
+            "fn error_only() -> Result<(), AuthError> { Err(AuthError::Forbidden) }
+             fn matches_error(error: AuthError) { match error { AuthError::Forbidden => (), _ => () } }",
+        )
+        .unwrap();
+        let error_handlers = collect_authorized_handlers(Path::new("errors.rs"), &error_syntax);
+        assert!(!error_handlers.contains_key("error_only"));
+        assert!(!error_handlers.contains_key("matches_error"));
     }
 
     #[test]
