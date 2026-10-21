@@ -524,16 +524,99 @@ fn first_string_arg_line(
     }
 }
 
+/// Method-specific `Route` constructors provided by `actix_web::web`.
+const ROUTE_METHOD_CONSTRUCTORS: [&str; 7] =
+    ["get", "post", "put", "patch", "delete", "head", "trace"];
+
+/// `http::Method` constants accepted by `web::method(...)` and `Route::method(...)`.
+const HTTP_METHOD_CONSTANTS: [&str; 9] = [
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+];
+
+/// Reads the HTTP method from a route's builder (its last argument). Only the
+/// builder's own call chain is followed, so calls nested in guard, handler, or
+/// configuration arguments cannot supply the method.
 fn extract_http_method(expr: &ExprMethodCall) -> String {
-    let rendered = expr.args.to_token_stream().to_string();
-    for method in ["get", "post", "put", "patch", "delete", "head"] {
-        if rendered.contains(&format!("web :: {method}"))
-            || rendered.contains(&format!("web::{method}"))
-        {
-            return method.to_uppercase();
+    expr.args
+        .last()
+        .and_then(route_builder_method)
+        .unwrap_or_else(|| "UNKNOWN".into())
+}
+
+fn route_builder_method(builder: &Expr) -> Option<String> {
+    let mut methods = Vec::new();
+    let mut expr = builder;
+    let root = loop {
+        match expr {
+            Expr::MethodCall(call) => {
+                // `Route::method` adds a method guard; other builder calls
+                // (`to`, `guard`, ...) do not constrain the method.
+                if call.method == "method" {
+                    methods.push(method_constant(call.args.first()?)?);
+                }
+                expr = &call.receiver;
+            }
+            Expr::Paren(paren) => expr = &paren.expr,
+            Expr::Group(group) => expr = &group.expr,
+            Expr::Call(call) => break call,
+            _ => return None,
         }
+    };
+
+    let Expr::Path(function) = &*root.func else {
+        return None;
+    };
+    if function.qself.is_some() {
+        return None;
     }
-    "UNKNOWN".into()
+    let segments: Vec<String> = function
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let (name, module) = segments.split_last()?;
+    let module: Vec<&str> = module.iter().map(String::as_str).collect();
+    let web_function = matches!(module.as_slice(), [] | ["web"] | ["actix_web", "web"]);
+    let any_method_route = (web_function && name == "route")
+        || (matches!(module.as_slice(), ["Route"] | ["actix_web", "Route"]) && name == "new");
+
+    if web_function && ROUTE_METHOD_CONSTRUCTORS.contains(&name.as_str()) {
+        methods.push(name.to_uppercase());
+    } else if web_function && name == "method" {
+        methods.push(method_constant(root.args.first()?)?);
+    } else if !any_method_route {
+        // Not a recognized `Route` constructor.
+        return None;
+    }
+
+    methods.dedup();
+    match methods.as_slice() {
+        [method] => Some(method.clone()),
+        // An any-method route without a method guard, or conflicting guards.
+        _ => None,
+    }
+}
+
+/// Reads `Method::PUT`, `http::Method::PUT`, or `actix_web::http::Method::PUT`.
+fn method_constant(expr: &Expr) -> Option<String> {
+    let Expr::Path(path) = expr else {
+        return None;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        [.., kind, method]
+            if kind == "Method" && HTTP_METHOD_CONSTANTS.contains(&method.as_str()) =>
+        {
+            Some(method.clone())
+        }
+        _ => None,
+    }
 }
 
 fn classify_authorization(
@@ -2212,6 +2295,140 @@ mod tests {
         let generic_evidence =
             classify_authorization(&generic_guard, None, &[], Path::new("fixture.rs"));
         assert!(generic_evidence.is_empty());
+    }
+
+    #[test]
+    fn http_method_extraction_follows_the_route_builder_chain() {
+        // Fixtures are route registrations parsed with `syn`. Constructors and
+        // method constants follow actix-web 4: `web::{get, post, put, patch,
+        // delete, head, trace}`, `web::method(Method::X)`, `web::route()`, and
+        // `Route::method(Method::X)`, which adds a method guard. OPTIONS and
+        // CONNECT have no `web::` constructor and are written with `Method::`.
+        for (route, expected) in [
+            // Cases from the reviewed branch commit 05561a3.
+            (
+                r#"web::scope("/api").route("/users", web::get().to(h))"#,
+                "GET",
+            ),
+            (
+                r#"web::scope("/api").route("/users", web::post().guard(AdminGuard).to(h))"#,
+                "POST",
+            ),
+            (r#"web::scope("/api").route("/users", get().to(h))"#, "GET"),
+            (
+                r#"web::scope("/api").route("/users", actix_web::web::delete().to(h))"#,
+                "DELETE",
+            ),
+            (r#"web::resource("/users").route(web::put().to(h))"#, "PUT"),
+            (
+                r#"web::scope("/api").route("/web/get_users", custom_helper("web::get"))"#,
+                "UNKNOWN",
+            ),
+            // Calls nested in guard, configuration, or handler arguments are ignored.
+            (
+                r#"cfg.route("/mode", web::route().guard(guard::Header("x-mode", config.get("mode"))).to(h))"#,
+                "UNKNOWN",
+            ),
+            (
+                r#"cfg.route("/flag", web::post().guard(guard::fn_guard(|ctx| config.get("flag").is_some())).to(h))"#,
+                "POST",
+            ),
+            (
+                r#"cfg.route("/users", web::post().to(web::get_users))"#,
+                "POST",
+            ),
+            (r#"cfg.route("/users", my_routes::get().to(h))"#, "UNKNOWN"),
+            // Remaining constructors.
+            (r#"cfg.route("/x", web::patch().to(h))"#, "PATCH"),
+            (r#"cfg.route("/x", web::head().to(h))"#, "HEAD"),
+            (r#"cfg.route("/x", web::trace().to(h))"#, "TRACE"),
+            (r#"cfg.route("/x", web::options().to(h))"#, "UNKNOWN"),
+            // `web::method(...)` with qualified constants.
+            (r#"cfg.route("/x", web::method(Method::PUT).to(h))"#, "PUT"),
+            (
+                r#"cfg.route("/x", web::method(http::Method::PUT).to(h))"#,
+                "PUT",
+            ),
+            (
+                r#"cfg.route("/x", actix_web::web::method(actix_web::http::Method::PUT).to(h))"#,
+                "PUT",
+            ),
+            (
+                r#"cfg.route("/x", web::method(Method::OPTIONS).to(h))"#,
+                "OPTIONS",
+            ),
+            (
+                r#"cfg.route("/x", web::method(Method::from_bytes(b"PUT").unwrap()).to(h))"#,
+                "UNKNOWN",
+            ),
+            // `Route::method(...)` on an any-method route.
+            (
+                r#"cfg.route("/x", web::route().method(Method::PUT).to(h))"#,
+                "PUT",
+            ),
+            (
+                r#"cfg.route("/x", web::route().method(http::Method::CONNECT).guard(g).to(h))"#,
+                "CONNECT",
+            ),
+            (
+                r#"cfg.route("/x", Route::new().method(Method::DELETE).to(h))"#,
+                "DELETE",
+            ),
+            (r#"cfg.route("/x", web::route().to(h))"#, "UNKNOWN"),
+            // Method guards that agree keep the method; conflicting ones do not.
+            (
+                r#"cfg.route("/x", web::get().method(Method::GET).to(h))"#,
+                "GET",
+            ),
+            (
+                r#"cfg.route("/x", web::get().method(Method::POST).to(h))"#,
+                "UNKNOWN",
+            ),
+        ] {
+            let call: ExprMethodCall = syn::parse_str(route).unwrap();
+            assert_eq!(extract_http_method(&call), expected, "{route}");
+        }
+    }
+
+    #[test]
+    fn extracted_routes_carry_builder_methods_without_changing_handler_resolution() {
+        let syntax: syn::File = syn::parse_str(
+            r#"
+            fn require_admin() {}
+            async fn get_users() { require_admin(); }
+            async fn h() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/api")
+                    .route("/users", web::post().to(get_users))
+                    .route("/mode", web::route().guard(guard::Header("x-mode", config.get("mode"))).to(h))
+                    .route("/web/get_users", custom_helper("web::get"))
+                    .route("/put", web::route().method(Method::PUT).to(h)));
+            }
+            "#,
+        )
+        .unwrap();
+        let file = Path::new("methods.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+        let route = |path: &str| {
+            visitor
+                .routes
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("missing route {path}"))
+        };
+
+        assert_eq!(visitor.routes.len(), 4);
+        assert_eq!(route("/api/users").method, "POST");
+        assert_eq!(route("/api/mode").method, "UNKNOWN");
+        assert_eq!(route("/api/web/get_users").method, "UNKNOWN");
+        assert_eq!(route("/api/put").method, "PUT");
+
+        let users = route("/api/users");
+        assert_eq!(users.handler_resolution, Some(HandlerResolution::Local));
+        assert_eq!(users.authorization.len(), 1);
+        assert_eq!(users.authorization[0].mechanism, "require_admin");
     }
 
     #[test]
