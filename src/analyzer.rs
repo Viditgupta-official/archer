@@ -1384,6 +1384,34 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         visit::visit_expr_path(self, node);
     }
 
+    // Expression and statement macros both reach this hook once. Only the
+    // macro's own name is classified, with the helper-name rules; its tokens
+    // are opaque, so calls written inside a macro (`assert!(is_admin(&user))`)
+    // are not evidence.
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let Some(name) = node
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+        else {
+            return;
+        };
+        let Some((kind, strength)) = classify_check_name(&name) else {
+            return;
+        };
+        let symbol = node.path.to_token_stream().to_string().replace(' ', "");
+        self.evidence.push(AuthEvidence {
+            kind,
+            mechanism: name,
+            symbol: Some(format!("{symbol}!")),
+            file: self.file.clone(),
+            line: node.path.span().start().line,
+            handler: Some(self.handler.clone()),
+            strength,
+        });
+    }
+
     // Functions declared inside the handler body, including methods of nested
     // `impl` and `trait` items, do not run as part of that body. Their
     // evidence belongs to them, not to the enclosing handler.
@@ -4255,5 +4283,280 @@ mod secure {
                 "{isolated}"
             );
         }
+    }
+
+    fn macro_evidence(
+        source: &str,
+    ) -> HashMap<String, Vec<(AuthEvidenceKind, String, String, AuthStrength)>> {
+        let syntax: syn::File = syn::parse_str(source).unwrap();
+        collect_authorized_handlers(Path::new("macros.rs"), &syntax)
+            .into_iter()
+            .map(|(handler, evidence)| {
+                let evidence = evidence
+                    .into_iter()
+                    .map(|item| {
+                        assert_eq!(item.handler.as_deref(), Some(handler.as_str()));
+                        (
+                            item.kind,
+                            item.mechanism,
+                            item.symbol.unwrap(),
+                            item.strength,
+                        )
+                    })
+                    .collect();
+                (handler, evidence)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn statement_and_expression_macros_use_the_helper_name_rules() {
+        let evidence = macro_evidence(
+            r#"
+            fn statement() { require_admin!(user); }
+            fn braced() { check_admin! { user } }
+            fn expression() { let allowed = check_permission!(user, "reports:read"); if allowed {} }
+            fn tail() -> bool { has_role!(user, "manager") }
+            fn condition() { if !is_owner!(user, document) { return; } }
+            fn ownership() { ensure_owner!(user, document); }
+            fn authentication() { require_auth!(request); }
+            "#,
+        );
+        use AuthEvidenceKind::*;
+        use AuthStrength::*;
+        let single = |handler: &str| {
+            assert_eq!(evidence[handler].len(), 1, "{handler}");
+            evidence[handler][0].clone()
+        };
+
+        assert_eq!(
+            single("statement"),
+            (
+                RoleCheck,
+                "require_admin".into(),
+                "require_admin!".into(),
+                Strong
+            )
+        );
+        assert_eq!(
+            single("braced"),
+            (
+                RoleCheck,
+                "check_admin".into(),
+                "check_admin!".into(),
+                Strong
+            )
+        );
+        assert_eq!(
+            single("expression"),
+            (
+                PermissionCheck,
+                "check_permission".into(),
+                "check_permission!".into(),
+                Strong
+            )
+        );
+        assert_eq!(
+            single("tail"),
+            (RoleCheck, "has_role".into(), "has_role!".into(), Strong)
+        );
+        assert_eq!(
+            single("condition"),
+            (
+                OwnershipCheck,
+                "is_owner".into(),
+                "is_owner!".into(),
+                Medium
+            )
+        );
+        assert_eq!(
+            single("ownership"),
+            (
+                OwnershipCheck,
+                "ensure_owner".into(),
+                "ensure_owner!".into(),
+                Medium
+            )
+        );
+        assert_eq!(
+            single("authentication"),
+            (
+                IdentityExtraction,
+                "require_auth".into(),
+                "require_auth!".into(),
+                Weak
+            )
+        );
+
+        let syntax: syn::File = syn::parse_str(
+            "fn admin() {\n    log::info!(\"start\");\n    require_admin!(user);\n}",
+        )
+        .unwrap();
+        let line = collect_authorized_handlers(Path::new("macros.rs"), &syntax)["admin"][0].line;
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn logging_formatting_and_unrelated_macros_are_not_evidence() {
+        let evidence = macro_evidence(
+            r#"
+            fn output(user: &str) {
+                println!("admin {}", user);
+                let message = format!("role: {}", user);
+                info!("permission check for {}", user);
+                log::warn!("admin access denied");
+                tracing::debug!(role = "admin");
+                eprintln!("{}", message);
+            }
+            fn assertions(user: &User) {
+                assert!(is_admin(user));
+                debug_assert!(has_role(user, "admin"));
+                assert_eq!(user.role, "admin");
+                let roles = vec![require_admin()];
+            }
+            fn names() {
+                check_admin_log!(user);
+                ensure_admin_exists!(user);
+                role_name!(user);
+                log_permission_check!(user);
+                admin_dashboard!();
+                verify_access_token!(token);
+            }
+            fn definitions() {
+                macro_rules! require_admin { () => { require_admin() }; }
+            }
+            "#,
+        );
+        assert!(evidence.is_empty(), "{evidence:?}");
+    }
+
+    #[test]
+    fn qualified_macro_paths_use_their_last_segment() {
+        let evidence = macro_evidence(
+            r#"
+            fn module() { auth::require_admin!(user); }
+            fn crate_path() { crate::guards::check_permission!(user, "write"); }
+            fn absolute() { ::authz::authorize!(user, action); }
+            fn logging() { guards::admin::info!("checked"); }
+            "#,
+        );
+        use AuthEvidenceKind::*;
+        use AuthStrength::*;
+        assert_eq!(
+            evidence["module"],
+            vec![(
+                RoleCheck,
+                "require_admin".into(),
+                "auth::require_admin!".into(),
+                Strong
+            )]
+        );
+        assert_eq!(
+            evidence["crate_path"],
+            vec![(
+                PermissionCheck,
+                "check_permission".into(),
+                "crate::guards::check_permission!".into(),
+                Strong
+            )]
+        );
+        assert_eq!(
+            evidence["absolute"],
+            vec![(
+                ManualAuthorizationCheck,
+                "authorize".into(),
+                "::authz::authorize!".into(),
+                Strong
+            )]
+        );
+        assert!(!evidence.contains_key("logging"));
+    }
+
+    #[test]
+    fn macro_evidence_stays_with_its_own_handler() {
+        let evidence = route_evidence(
+            r#"
+            async fn outer() {
+                fn nested() { require_admin!(user); }
+                struct Helper;
+                impl Helper { fn check(&self) { check_permission!(user); } }
+                trait Policy { fn verify(&self) { authorize!(user); } }
+                macro_rules! hidden { () => { require_admin!(user) }; }
+            }
+            async fn protected() { require_admin!(user); }
+            async fn sibling() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/admin")
+                    .route("/outer", web::get().to(outer))
+                    .route("/protected", web::get().to(protected))
+                    .route("/sibling", web::get().to(sibling)));
+            }
+            "#,
+        );
+        assert!(
+            evidence["/admin/outer"].is_empty(),
+            "{:?}",
+            evidence["/admin/outer"]
+        );
+        assert_eq!(
+            evidence["/admin/protected"],
+            vec![(AuthEvidenceKind::RoleCheck, "require_admin".to_owned())]
+        );
+        assert!(evidence["/admin/sibling"].is_empty());
+    }
+
+    #[test]
+    fn macro_handler_and_middleware_evidence_are_kept_once_each() {
+        let source = r#"
+            fn check_permission() {}
+            async fn users() {
+                require_admin!(user);
+                check_permission();
+                log::info!("users");
+            }
+            async fn orders() { require_admin!(user); }
+            async fn reports() { require_admin!(user); }
+            async fn payments() { log::info!("payments"); }
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/admin")
+                    .route("/users", web::get().guard(RoleGuard).to(users))
+                    .route("/orders", web::get().to(orders))
+                    .route("/reports", web::get().to(reports))
+                    .route("/payments", web::get().to(payments))
+                    .wrap(AuthMiddleware));
+            }
+        "#;
+        let evidence = route_evidence(source);
+        use AuthEvidenceKind::*;
+        let identity = (IdentityExtraction, "AuthMiddleware".to_owned());
+        let role_macro = (RoleCheck, "require_admin".to_owned());
+        assert_eq!(
+            evidence["/admin/users"],
+            vec![
+                (AuthorizationGuard, "RoleGuard".to_owned()),
+                role_macro.clone(),
+                (PermissionCheck, "check_permission".to_owned()),
+                identity.clone(),
+            ]
+        );
+        for path in ["/admin/orders", "/admin/reports"] {
+            assert_eq!(
+                evidence[path],
+                vec![role_macro.clone(), identity.clone()],
+                "{path}"
+            );
+        }
+        assert_eq!(evidence["/admin/payments"], vec![identity]);
+
+        // Macro evidence feeds drift inference like any other handler evidence.
+        let syntax: syn::File = syn::parse_str(source).unwrap();
+        let file = Path::new("scopes.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+        let (_, _, details, _) = build_analysis_layers(&visitor.routes);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].suspicious_route.path, "/admin/payments");
+        assert_eq!(details[0].authorized_peer_routes.len(), 3);
     }
 }
