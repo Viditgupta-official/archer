@@ -219,6 +219,9 @@ struct RouteVisitor<'a> {
     crate_key: PathBuf,
     module: Vec<String>,
     block_scopes: Vec<BlockScope>,
+    /// Guard and middleware evidence of the builder chains being visited,
+    /// keyed by chain root: the current scope and its enclosing scopes.
+    chain_scopes: Vec<(*const Expr, Vec<AuthEvidence>)>,
     scope_context: String,
     routes: Vec<Route>,
 }
@@ -236,6 +239,7 @@ impl<'a> RouteVisitor<'a> {
             crate_key,
             module,
             block_scopes: Vec::new(),
+            chain_scopes: Vec::new(),
             scope_context: String::new(),
             routes: Vec::new(),
         }
@@ -318,8 +322,18 @@ impl<'a> RouteVisitor<'a> {
             },
         };
         let handler = target.as_ref().and_then(HandlerTarget::name);
-        let authorization =
+        let mut authorization =
             classify_authorization(node, handler.as_deref(), &handler_evidence, &self.file);
+        // Middleware and guards of this route's scope, wherever they appear in
+        // its builder chain, and of every enclosing scope. Evidence already
+        // found on the route's own receiver chain is not repeated.
+        for inherited in self.chain_scopes.iter().flat_map(|(_, evidence)| evidence) {
+            let mut inherited = inherited.clone();
+            inherited.handler = handler.clone();
+            if !authorization.contains(&inherited) {
+                authorization.push(inherited);
+            }
+        }
 
         let line = first_string_arg_line(&node.args).unwrap_or_else(|| node.span().start().line);
 
@@ -440,6 +454,16 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        // The outermost call of a builder chain is visited first; collect the
+        // chain's guards and middleware there so that every route in the chain,
+        // and in scopes nested under it, receives them.
+        let root = chain_root(node);
+        let starts_chain = self.chain_scopes.last().map(|(chain, _)| *chain) != Some(root);
+        if starts_chain {
+            let evidence = chain_configuration_evidence(node, &self.file);
+            self.chain_scopes.push((root, evidence));
+        }
+
         if node.method == "service" {
             let previous_context = self.scope_context.clone();
             self.scope_context = join_paths(&previous_context, &scope_prefix(&node.receiver));
@@ -448,11 +472,14 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             }
             self.scope_context = previous_context;
             self.visit_expr(&node.receiver);
-            return;
+        } else {
+            self.add_route(node);
+            visit::visit_expr_method_call(self, node);
         }
 
-        self.add_route(node);
-        visit::visit_expr_method_call(self, node);
+        if starts_chain {
+            self.chain_scopes.pop();
+        }
     }
 }
 
@@ -651,31 +678,7 @@ fn visit_route_configuration(
 ) {
     match expr {
         Expr::MethodCall(method) => {
-            if method.method == "guard" || method.method == "wrap" {
-                let kind = if method.method == "guard" {
-                    AuthEvidenceKind::AuthorizationGuard
-                } else {
-                    AuthEvidenceKind::AuthorizationMiddleware
-                };
-                let strength = if method.method == "guard" {
-                    AuthStrength::Strong
-                } else {
-                    AuthStrength::Medium
-                };
-                for arg in &method.args {
-                    if let Some(identifier) = authorization_identifier_in_expr(arg) {
-                        evidence.push(AuthEvidence {
-                            kind: kind.clone(),
-                            mechanism: identifier.name.clone(),
-                            symbol: Some(identifier.name),
-                            file: file.to_path_buf(),
-                            line: identifier.line,
-                            handler: handler.map(str::to_owned),
-                            strength: strength.clone(),
-                        });
-                    }
-                }
-            }
+            configuration_call_evidence(method, file, handler, evidence);
             visit_route_configuration(&method.receiver, file, handler, evidence);
             for arg in &method.args {
                 visit_route_configuration(arg, file, handler, evidence);
@@ -693,14 +696,80 @@ fn visit_scope_configuration(
     handler: Option<&str>,
     evidence: &mut Vec<AuthEvidence>,
 ) {
+    // Walk the scope's own builder chain. Sibling `.route(...)`, `.resource(...)`,
+    // and `.service(...)` registrations are passed through without reading
+    // their arguments, so one route's guards never apply to another.
     let Expr::MethodCall(method) = expr else {
         return;
     };
-    if method.method == "route" || method.method == "resource" {
-        return;
-    }
-    visit_route_configuration(expr, file, handler, evidence);
+    configuration_call_evidence(method, file, handler, evidence);
     visit_scope_configuration(&method.receiver, file, handler, evidence);
+}
+
+/// Records evidence from one `.guard(...)` or `.wrap(...)` call's arguments.
+fn configuration_call_evidence(
+    method: &ExprMethodCall,
+    file: &Path,
+    handler: Option<&str>,
+    evidence: &mut Vec<AuthEvidence>,
+) {
+    let (authorization_kind, authorization_strength) = match method.method.to_string().as_str() {
+        "guard" => (AuthEvidenceKind::AuthorizationGuard, AuthStrength::Strong),
+        "wrap" => (
+            AuthEvidenceKind::AuthorizationMiddleware,
+            AuthStrength::Medium,
+        ),
+        _ => return,
+    };
+    for arg in &method.args {
+        let Some((class, identifier)) = route_configuration_name_in_expr(arg) else {
+            continue;
+        };
+        // Authentication-only guards and middleware establish who the caller
+        // is, not what they may do.
+        let (kind, strength) = match class {
+            RouteConfigurationName::Authorization => {
+                (authorization_kind.clone(), authorization_strength.clone())
+            }
+            RouteConfigurationName::Authentication => {
+                (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
+            }
+        };
+        evidence.push(AuthEvidence {
+            kind,
+            mechanism: identifier.name.clone(),
+            symbol: Some(identifier.name),
+            file: file.to_path_buf(),
+            line: identifier.line,
+            handler: handler.map(str::to_owned),
+            strength,
+        });
+    }
+}
+
+/// Evidence from every `.guard(...)` / `.wrap(...)` call in a builder chain,
+/// starting at its outermost call. Actix applies a scope's middleware to all
+/// of the scope's routes, wherever the call appears in the chain.
+fn chain_configuration_evidence(outermost: &ExprMethodCall, file: &Path) -> Vec<AuthEvidence> {
+    let mut evidence = Vec::new();
+    let mut call = outermost;
+    loop {
+        configuration_call_evidence(call, file, None, &mut evidence);
+        match &*call.receiver {
+            Expr::MethodCall(receiver) => call = receiver,
+            _ => return evidence,
+        }
+    }
+}
+
+/// The expression a method-call chain starts from (`web::scope("/s")` in
+/// `web::scope("/s").wrap(X).route(...)`); it identifies the chain.
+fn chain_root(call: &ExprMethodCall) -> *const Expr {
+    let mut expr = &*call.receiver;
+    while let Expr::MethodCall(receiver) = expr {
+        expr = &receiver.receiver;
+    }
+    expr
 }
 
 /// Collects the names a pattern binds. A bare identifier is always counted,
@@ -1331,22 +1400,10 @@ fn evidence_for_handler_method(
     file: &Path,
     handler: &str,
 ) -> Option<AuthEvidence> {
-    let (kind, strength) =
-        if method == "require_admin" || method.contains("role") || method.contains("authorize") {
-            (AuthEvidenceKind::RoleCheck, AuthStrength::Strong)
-        } else if method.contains("permission") || method == "has_permission" {
-            (AuthEvidenceKind::PermissionCheck, AuthStrength::Strong)
-        } else if method.contains("ownership") || method.contains("owns") {
-            (AuthEvidenceKind::OwnershipCheck, AuthStrength::Medium)
-        } else if method.contains("identity")
-            || method.contains("claims")
-            || method == "current_user"
-            || method == "authenticated_user"
-        {
-            (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
-        } else {
-            return None;
-        };
+    let (kind, strength) = classify_check_name(method).or_else(|| {
+        (method.contains("identity") || method.contains("claims"))
+            .then_some((AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak))
+    })?;
     Some(AuthEvidence {
         kind,
         mechanism: method.into(),
@@ -1365,59 +1422,7 @@ fn evidence_for_handler_call(
     handler: &str,
 ) -> Option<AuthEvidence> {
     let name = symbol.rsplit("::").next().unwrap_or(symbol);
-    let lower = name.to_ascii_lowercase();
-    if ["error", "exception", "fault"]
-        .iter()
-        .any(|marker| lower.contains(marker))
-        || ["_title", "_name", "_status", "_id", "_count", "_description"]
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
-        || (lower.starts_with("author")
-            && !lower.starts_with("authoriz")
-            && !lower.starts_with("authoris"))
-        || lower.starts_with("authority")
-    {
-        return None;
-    }
-
-    let tokens: Vec<&str> = lower.split('_').collect();
-    let has_token = |candidates: &[&str]| tokens.iter().any(|token| candidates.contains(token));
-    // `access` is an authorization subject only as the final noun (`check_access`,
-    // `verify_resource_access`); as a modifier it names authentication artifacts
-    // such as `verify_access_token` or logging helpers such as `check_access_log`.
-    let ends_with_access = tokens.last() == Some(&"access");
-    let uses_check_prefix = ["require_", "check_", "verify_", "assert_", "ensure_"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix));
-
-    let (kind, strength) = if lower == "require_auth"
-        || lower == "is_authenticated"
-        || lower == "require_authenticated_user"
-        || lower == "current_user"
-        || lower == "authenticated_user"
-    {
-        (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
-    } else if ["authorize", "authorise", "is_authorized", "permit"].contains(&lower.as_str()) {
-        (
-            AuthEvidenceKind::ManualAuthorizationCheck,
-            AuthStrength::Strong,
-        )
-    } else if ["has_role", "has_any_role", "is_admin", "require_admin", "require_manager"]
-        .contains(&lower.as_str())
-        || (uses_check_prefix && has_token(&["admin", "manager", "role"]))
-    {
-        (AuthEvidenceKind::RoleCheck, AuthStrength::Strong)
-    } else if ["has_permission", "check_permission", "verify_permission"]
-        .contains(&lower.as_str())
-        || (uses_check_prefix && (has_token(&["permission"]) || ends_with_access))
-    {
-        (AuthEvidenceKind::PermissionCheck, AuthStrength::Strong)
-    } else if uses_check_prefix && has_token(&["owner", "ownership"]) {
-        (AuthEvidenceKind::OwnershipCheck, AuthStrength::Medium)
-    } else {
-        return None;
-    };
-
+    let (kind, strength) = classify_check_name(name)?;
     Some(AuthEvidence {
         kind,
         mechanism: name.into(),
@@ -1427,6 +1432,117 @@ fn evidence_for_handler_call(
         handler: Some(handler.into()),
         strength,
     })
+}
+
+/// Final words that make a helper name a data, lookup, or logging operation
+/// rather than an enforcement check (`ensure_admin_exists`, `check_admin_token`,
+/// `role_name`, `permissions_list`, `check_access_log`).
+const NON_CHECK_FINAL_WORDS: [&str; 26] = [
+    "exists",
+    "exist",
+    "list",
+    "count",
+    "name",
+    "names",
+    "title",
+    "id",
+    "ids",
+    "status",
+    "description",
+    "log",
+    "logs",
+    "token",
+    "tokens",
+    "info",
+    "data",
+    "config",
+    "settings",
+    "cache",
+    "url",
+    "path",
+    "email",
+    "header",
+    "headers",
+    "lookup",
+];
+
+/// Classifies a called helper by its snake_case name. This is a lexical
+/// heuristic: it recognizes conventional enforcement names but cannot see what
+/// a helper does, and identity/authentication helpers are never authorization.
+fn classify_check_name(name: &str) -> Option<(AuthEvidenceKind, AuthStrength)> {
+    let lower = name.to_ascii_lowercase();
+    if ["error", "exception", "fault"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || (lower.starts_with("author")
+            && !lower.starts_with("authoriz")
+            && !lower.starts_with("authoris"))
+        || lower.starts_with("authority")
+    {
+        return None;
+    }
+
+    let tokens: Vec<&str> = lower.split('_').filter(|token| !token.is_empty()).collect();
+    let last = *tokens.last()?;
+    if NON_CHECK_FINAL_WORDS.contains(&last) {
+        return None;
+    }
+    let has_token = |candidates: &[&str]| tokens.iter().any(|token| candidates.contains(token));
+    let is_one_of = |names: &[&str]| names.contains(&lower.as_str());
+    // `access` is an authorization subject only as the final noun (`check_access`,
+    // `verify_resource_access`); as a modifier it names authentication artifacts
+    // such as `verify_access_token` or logging helpers such as `check_access_log`.
+    let ends_with_access = last == "access";
+    let uses_check_prefix = ["require_", "check_", "verify_", "assert_", "ensure_"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+
+    let classification = if is_one_of(&[
+        "require_auth",
+        "is_authenticated",
+        "require_authenticated_user",
+        "current_user",
+        "authenticated_user",
+    ]) {
+        (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
+    } else if is_one_of(&["authorize", "authorise", "is_authorized", "permit"])
+        || ["authorize_", "authorise_", "is_authorized_"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+    {
+        (
+            AuthEvidenceKind::ManualAuthorizationCheck,
+            AuthStrength::Strong,
+        )
+    } else if is_one_of(&[
+        "has_role",
+        "has_roles",
+        "has_any_role",
+        "is_admin",
+        "require_admin",
+        "require_manager",
+    ]) || (uses_check_prefix
+        && has_token(&["admin", "admins", "manager", "role", "roles"]))
+    {
+        (AuthEvidenceKind::RoleCheck, AuthStrength::Strong)
+    } else if is_one_of(&[
+        "has_permission",
+        "has_permissions",
+        "has_any_permission",
+        "check_permission",
+        "verify_permission",
+    ]) || (uses_check_prefix
+        && (has_token(&["permission", "permissions"]) || ends_with_access))
+    {
+        (AuthEvidenceKind::PermissionCheck, AuthStrength::Strong)
+    } else if is_one_of(&["owns", "is_owner", "is_owned_by"])
+        || (uses_check_prefix && has_token(&["owner", "ownership"]))
+    {
+        (AuthEvidenceKind::OwnershipCheck, AuthStrength::Medium)
+    } else {
+        return None;
+    };
+    Some(classification)
 }
 
 fn evidence_for_handler_symbol(
@@ -1464,33 +1580,126 @@ fn evidence_for_handler_symbol(
     None
 }
 
-fn is_authorization_identifier(identifier: &str) -> bool {
-    let identifier = identifier.to_lowercase();
-    identifier == "require_admin"
-        || identifier.ends_with("guard")
-            && (identifier.contains("admin")
-                || identifier.contains("auth")
-                || identifier.contains("role")
-                || identifier.contains("permission"))
-        || identifier.ends_with("middleware")
-            && (identifier.contains("auth")
-                || identifier.contains("authoriz")
-                || identifier.contains("permission")
-                || identifier.contains("role")
-                || identifier.contains("admin"))
+/// What a `.guard(...)` or `.wrap(...)` argument name indicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteConfigurationName {
+    /// An authorization guard or middleware, such as `AdminGuard` or `check_admin`.
+    Authorization,
+    /// Authentication only, such as `AuthMiddleware` or `HttpAuthentication`.
+    Authentication,
 }
 
-fn is_authorization_name(identifier: &str) -> bool {
-    is_authorization_identifier(identifier)
-        || identifier.contains("permission")
-        || identifier.contains("authorize")
-        || identifier.contains("role")
+const CONFIGURATION_EXCLUDED_WORDS: [&str; 15] = [
+    "error",
+    "errors",
+    "err",
+    "exception",
+    "fault",
+    "unauthorized",
+    "forbidden",
+    "log",
+    "logs",
+    "logger",
+    "logging",
+    "metrics",
+    "tracing",
+    "telemetry",
+    "audit",
+];
+const CONFIGURATION_AUTHORIZATION_WORDS: [&str; 12] = [
+    "admin",
+    "admins",
+    "role",
+    "roles",
+    "permission",
+    "permissions",
+    "authorization",
+    "authorize",
+    "authorized",
+    "authz",
+    "acl",
+    "rbac",
+];
+const CONFIGURATION_AUTHENTICATION_WORDS: [&str; 10] = [
+    "auth",
+    "authn",
+    "authentication",
+    "authenticate",
+    "authenticated",
+    "jwt",
+    "bearer",
+    "login",
+    "oauth",
+    "identity",
+];
+const CONFIGURATION_SHAPE_WORDS: [&str; 11] = [
+    "guard",
+    "middleware",
+    "filter",
+    "gate",
+    "only",
+    "require",
+    "requires",
+    "check",
+    "verify",
+    "enforce",
+    "enforcer",
+];
+
+/// Classifies one path segment of a guard or middleware argument. snake_case
+/// names (guard functions) use the helper-name classifier; type names need an
+/// authorization word and a guard-like word, so `PermissionsPolicy`,
+/// `RoleLogger`, and `UnauthorizedHandler` are not authorization.
+fn classify_route_configuration_name(identifier: &str) -> Option<RouteConfigurationName> {
+    if !identifier.chars().any(char::is_uppercase) {
+        let (kind, _) = classify_check_name(identifier)?;
+        return Some(if kind == AuthEvidenceKind::IdentityExtraction {
+            RouteConfigurationName::Authentication
+        } else {
+            RouteConfigurationName::Authorization
+        });
+    }
+
+    let words = camel_case_words(identifier);
+    let has_word =
+        |candidates: &[&str]| words.iter().any(|word| candidates.contains(&word.as_str()));
+    if has_word(&CONFIGURATION_EXCLUDED_WORDS) {
+        None
+    } else if has_word(&CONFIGURATION_AUTHORIZATION_WORDS) && has_word(&CONFIGURATION_SHAPE_WORDS) {
+        Some(RouteConfigurationName::Authorization)
+    } else if identifier == "HttpAuthentication"
+        || (has_word(&CONFIGURATION_AUTHENTICATION_WORDS) && has_word(&CONFIGURATION_SHAPE_WORDS))
+    {
+        Some(RouteConfigurationName::Authentication)
+    } else {
+        None
+    }
 }
 
-fn authorization_identifier_in_expr(expr: &Expr) -> Option<NamedIdentifier> {
-    let mut visitor = AuthorizationNameVisitor::default();
-    visitor.visit_expr(expr);
-    visitor.identifier
+/// Splits `AdminAuthMiddleware` or `JWTGuard` into lowercase words.
+fn camel_case_words(identifier: &str) -> Vec<String> {
+    let characters: Vec<char> = identifier.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    for (index, &character) in characters.iter().enumerate() {
+        let starts_word = index == 0
+            || character == '_'
+            || character.is_uppercase()
+                && (characters[index - 1].is_lowercase()
+                    || characters
+                        .get(index + 1)
+                        .is_some_and(|next| next.is_lowercase()));
+        if character == '_' {
+            continue;
+        }
+        if starts_word || words.is_empty() {
+            words.push(String::new());
+        }
+        if let Some(word) = words.last_mut() {
+            word.extend(character.to_lowercase());
+        }
+    }
+    words.retain(|word| !word.is_empty());
+    words
 }
 
 #[derive(Debug, Clone)]
@@ -1499,24 +1708,44 @@ struct NamedIdentifier {
     line: usize,
 }
 
-#[derive(Default)]
-struct AuthorizationNameVisitor {
-    identifier: Option<NamedIdentifier>,
+/// Finds the most specific authorization-related name in a guard or
+/// middleware argument; an authorization name wins over an authentication one.
+fn route_configuration_name_in_expr(
+    expr: &Expr,
+) -> Option<(RouteConfigurationName, NamedIdentifier)> {
+    let mut visitor = RouteConfigurationNameVisitor::default();
+    visitor.visit_expr(expr);
+    visitor
+        .authorization
+        .map(|name| (RouteConfigurationName::Authorization, name))
+        .or_else(|| {
+            visitor
+                .authentication
+                .map(|name| (RouteConfigurationName::Authentication, name))
+        })
 }
 
-impl<'ast> Visit<'ast> for AuthorizationNameVisitor {
+#[derive(Default)]
+struct RouteConfigurationNameVisitor {
+    authorization: Option<NamedIdentifier>,
+    authentication: Option<NamedIdentifier>,
+}
+
+impl<'ast> Visit<'ast> for RouteConfigurationNameVisitor {
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
-        if self.identifier.is_none() {
-            self.identifier = node
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .find(|identifier| is_authorization_name(&identifier.to_lowercase()))
-                .map(|name| NamedIdentifier {
+        for segment in &node.path.segments {
+            let name = segment.ident.to_string();
+            let slot = match classify_route_configuration_name(&name) {
+                Some(RouteConfigurationName::Authorization) => &mut self.authorization,
+                Some(RouteConfigurationName::Authentication) => &mut self.authentication,
+                None => continue,
+            };
+            if slot.is_none() {
+                *slot = Some(NamedIdentifier {
                     name,
                     line: node.span().start().line,
                 });
+            }
         }
         visit::visit_expr_path(self, node);
     }
@@ -2566,6 +2795,412 @@ mod tests {
             file: PathBuf::from("access.rs"),
         };
         assert!(!token_route.is_authorized());
+    }
+
+    #[test]
+    fn helper_names_separate_enforcement_from_lookups_and_authentication() {
+        use AuthEvidenceKind::*;
+        for (name, expected) in [
+            // Plausible enforcement helpers.
+            ("require_admin", Some(RoleCheck)),
+            ("has_role", Some(RoleCheck)),
+            ("check_roles", Some(RoleCheck)),
+            ("is_admin", Some(RoleCheck)),
+            ("check_permission", Some(PermissionCheck)),
+            ("verify_finance_permission", Some(PermissionCheck)),
+            ("verify_resource_access", Some(PermissionCheck)),
+            ("check_resource_owner", Some(OwnershipCheck)),
+            ("is_owned_by", Some(OwnershipCheck)),
+            ("authorize", Some(ManualAuthorizationCheck)),
+            ("authorize_request", Some(ManualAuthorizationCheck)),
+            // Authentication is identity, never authorization.
+            ("require_auth", Some(IdentityExtraction)),
+            ("require_authenticated_user", Some(IdentityExtraction)),
+            // Misleading names: token validation, lookups, logging, and data.
+            ("verify_access_token", None),
+            ("check_username", None),
+            ("ensure_user_exists", None),
+            ("verify_oauth_state", None),
+            ("check_access_log", None),
+            ("ensure_admin_exists", None),
+            ("check_admin_token", None),
+            ("role_name", None),
+            ("permissions_list", None),
+            ("authorized_user", None),
+            ("downstream", None),
+            ("author_name", None),
+            ("handle_auth_error", None),
+        ] {
+            assert_eq!(
+                classify_check_name(name).map(|(kind, _)| kind),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn method_calls_use_word_rules_instead_of_substrings() {
+        let syntax: syn::File = syn::parse_str(
+            "fn is_admin_method(user: User) { user.is_admin(); }
+             fn has_role_method(user: User) { user.has_role(\"admin\"); }
+             fn owns_method(user: User) { user.owns(&doc); }
+             fn authorize_method(policy: Policy) { policy.authorize(&user); }
+             fn claims_method(req: Req) { req.extract_claims(); }
+             fn misleading_methods(user: User, stream: Stream, req: Req) {
+                 user.role_name();
+                 user.permissions_list();
+                 req.authorized_user();
+                 stream.downstream();
+             }",
+        )
+        .unwrap();
+        let handlers = collect_authorized_handlers(Path::new("methods.rs"), &syntax);
+
+        for (handler, kind) in [
+            ("is_admin_method", AuthEvidenceKind::RoleCheck),
+            ("has_role_method", AuthEvidenceKind::RoleCheck),
+            ("owns_method", AuthEvidenceKind::OwnershipCheck),
+            (
+                "authorize_method",
+                AuthEvidenceKind::ManualAuthorizationCheck,
+            ),
+            ("claims_method", AuthEvidenceKind::IdentityExtraction),
+        ] {
+            let evidence = &handlers[handler];
+            assert_eq!(evidence.len(), 1, "{handler}");
+            assert_eq!(evidence[0].kind, kind, "{handler}");
+        }
+        assert!(!handlers["claims_method"][0].is_authorization());
+        assert!(!handlers.contains_key("misleading_methods"));
+    }
+
+    #[test]
+    fn route_configuration_names_separate_authorization_from_authentication() {
+        assert_eq!(
+            camel_case_words("AdminAuthMiddleware"),
+            ["admin", "auth", "middleware"]
+        );
+        assert_eq!(camel_case_words("JWTGuard"), ["jwt", "guard"]);
+        assert_eq!(
+            camel_case_words("HttpAuthentication"),
+            ["http", "authentication"]
+        );
+
+        let evidence = |route: &str| {
+            let call: ExprMethodCall = syn::parse_str(route).unwrap();
+            classify_authorization(&call, None, &[], Path::new("fixture.rs"))
+                .into_iter()
+                .map(|item| (item.kind, item.mechanism, item.strength))
+                .collect::<Vec<_>>()
+        };
+        use AuthEvidenceKind::*;
+        use AuthStrength::*;
+        for (route, expected) in [
+            (
+                r#"web::scope("/a").route("/x", web::get().guard(AdminGuard).to(h))"#,
+                vec![(AuthorizationGuard, "AdminGuard", Strong)],
+            ),
+            (
+                r#"web::scope("/a").route("/x", web::get().guard(guard::fn_guard(check_admin)).to(h))"#,
+                vec![(AuthorizationGuard, "check_admin", Strong)],
+            ),
+            (
+                r#"web::scope("/a").wrap(RequireAdmin).route("/x", web::get().to(h))"#,
+                vec![(AuthorizationMiddleware, "RequireAdmin", Medium)],
+            ),
+            (
+                r#"web::scope("/a").wrap(AdminAuthMiddleware).route("/x", web::get().to(h))"#,
+                vec![(AuthorizationMiddleware, "AdminAuthMiddleware", Medium)],
+            ),
+            (
+                r#"web::scope("/a").wrap(AuthMiddleware).route("/x", web::get().to(h))"#,
+                vec![(IdentityExtraction, "AuthMiddleware", Weak)],
+            ),
+            (
+                r#"web::scope("/a").route("/x", web::get().guard(AuthGuard).to(h))"#,
+                vec![(IdentityExtraction, "AuthGuard", Weak)],
+            ),
+            (
+                r#"web::scope("/a").wrap(HttpAuthentication::bearer(validator)).route("/x", web::get().to(h))"#,
+                vec![(IdentityExtraction, "HttpAuthentication", Weak)],
+            ),
+            (
+                r#"web::scope("/a").wrap(UnauthorizedHandler).route("/x", web::get().to(h))"#,
+                vec![],
+            ),
+            (
+                r#"web::scope("/a").wrap(PermissionsPolicy::default()).route("/x", web::get().to(h))"#,
+                vec![],
+            ),
+            (
+                r#"web::scope("/a").wrap(RoleLogger).route("/x", web::get().to(h))"#,
+                vec![],
+            ),
+            // Authorization and guard words, but an error-mapping or logging type.
+            (
+                r#"web::scope("/a").wrap(AuthorizationErrorMiddleware).route("/x", web::get().to(h))"#,
+                vec![],
+            ),
+            (
+                r#"web::scope("/a").wrap(RoleCheckLogger).route("/x", web::get().to(h))"#,
+                vec![],
+            ),
+            (
+                r#"web::scope("/a").route("/x", web::get().guard(guard::Header("x-role", "admin")).to(h))"#,
+                vec![],
+            ),
+        ] {
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(kind, mechanism, strength)| (kind, mechanism.to_owned(), strength))
+                .collect();
+            assert_eq!(evidence(route), expected, "{route}");
+        }
+    }
+
+    #[test]
+    fn guard_and_middleware_evidence_keeps_handler_evidence() {
+        let syntax: syn::File = syn::parse_str(
+            r#"
+            fn require_admin() {}
+            async fn guarded() { check_permission(); }
+            async fn authenticated_admin() { require_admin(); }
+            async fn authenticated_only() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.route("/guarded", web::get().guard(AdminGuard).to(guarded));
+                cfg.service(web::scope("/session")
+                    .wrap(AuthMiddleware)
+                    .route("/admin", web::get().to(authenticated_admin)));
+                cfg.service(web::scope("/session")
+                    .wrap(AuthMiddleware)
+                    .route("/plain", web::get().to(authenticated_only)));
+            }
+            "#,
+        )
+        .unwrap();
+        let file = Path::new("mixed.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+        let kinds = |path: &str| {
+            let route = visitor
+                .routes
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap();
+            (
+                route.is_authorized(),
+                route
+                    .authorization
+                    .iter()
+                    .map(|item| item.kind.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        use AuthEvidenceKind::*;
+
+        assert_eq!(
+            kinds("/guarded"),
+            (true, vec![AuthorizationGuard, PermissionCheck])
+        );
+        assert_eq!(
+            kinds("/session/admin"),
+            (true, vec![IdentityExtraction, RoleCheck])
+        );
+        assert_eq!(kinds("/session/plain"), (false, vec![IdentityExtraction]));
+    }
+
+    fn route_evidence(source: &str) -> HashMap<String, Vec<(AuthEvidenceKind, String)>> {
+        let syntax: syn::File = syn::parse_str(source).unwrap();
+        let file = Path::new("scopes.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+        visitor
+            .routes
+            .into_iter()
+            .map(|route| {
+                let evidence = route
+                    .authorization
+                    .into_iter()
+                    .map(|item| (item.kind, item.mechanism))
+                    .collect();
+                (route.path, evidence)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scope_middleware_applies_to_every_route_in_its_chain() {
+        // Actix applies a scope's `.wrap(...)` to all of the scope's routes,
+        // wherever the call appears in the builder chain.
+        let evidence = route_evidence(
+            r#"
+            async fn h() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/before").wrap(AdminMiddleware)
+                    .route("/a", web::get().to(h))
+                    .route("/b", web::get().to(h)));
+                cfg.service(web::scope("/between")
+                    .route("/a", web::get().to(h))
+                    .wrap(AdminMiddleware)
+                    .route("/b", web::get().to(h)));
+                cfg.service(web::scope("/after")
+                    .route("/a", web::get().to(h))
+                    .route("/b", web::get().to(h))
+                    .wrap(AdminMiddleware));
+                cfg.service(web::scope("/leak")
+                    .route("/a", web::get().guard(AdminGuard).to(h))
+                    .wrap(Logger::default())
+                    .route("/b", web::get().to(h)));
+            }
+            "#,
+        );
+        let middleware = vec![(
+            AuthEvidenceKind::AuthorizationMiddleware,
+            "AdminMiddleware".to_owned(),
+        )];
+        for scope in ["/before", "/between", "/after"] {
+            for route in ["a", "b"] {
+                let path = format!("{scope}/{route}");
+                assert_eq!(evidence[&path], middleware, "{path}");
+            }
+        }
+        // A sibling route's own guard is not scope configuration.
+        assert_eq!(
+            evidence["/leak/a"],
+            vec![(
+                AuthEvidenceKind::AuthorizationGuard,
+                "AdminGuard".to_owned()
+            )]
+        );
+        assert!(evidence["/leak/b"].is_empty());
+    }
+
+    #[test]
+    fn nested_scopes_inherit_middleware_without_leaking_to_siblings() {
+        let evidence = route_evidence(
+            r#"
+            async fn h() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/api").wrap(AuthMiddleware)
+                    .service(web::scope("/admin").wrap(AdminMiddleware)
+                        .route("/x", web::get().to(h))
+                        .service(web::scope("/deep").guard(RoleGuard)
+                            .route("/z", web::get().to(h))))
+                    .service(web::scope("/public")
+                        .route("/y", web::get().to(h)))
+                    .route("/direct", web::get().to(h)));
+                cfg.service(web::scope("/other").route("/w", web::get().to(h)));
+            }
+            "#,
+        );
+        use AuthEvidenceKind::*;
+        let kinds = |path: &str| {
+            let mut found: Vec<(AuthEvidenceKind, &str)> = evidence[path]
+                .iter()
+                .map(|(kind, mechanism)| (kind.clone(), mechanism.as_str()))
+                .collect();
+            found.sort_by_key(|(_, mechanism)| mechanism.to_owned());
+            found
+        };
+
+        assert_eq!(
+            kinds("/api/admin/x"),
+            vec![
+                (AuthorizationMiddleware, "AdminMiddleware"),
+                (IdentityExtraction, "AuthMiddleware"),
+            ]
+        );
+        assert_eq!(
+            kinds("/api/admin/deep/z"),
+            vec![
+                (AuthorizationMiddleware, "AdminMiddleware"),
+                (IdentityExtraction, "AuthMiddleware"),
+                (AuthorizationGuard, "RoleGuard"),
+            ]
+        );
+        // Siblings receive the shared parent's middleware but not each other's.
+        assert_eq!(
+            kinds("/api/public/y"),
+            vec![(IdentityExtraction, "AuthMiddleware")]
+        );
+        assert_eq!(
+            kinds("/api/direct"),
+            vec![(IdentityExtraction, "AuthMiddleware")]
+        );
+        // An unrelated top-level scope receives nothing.
+        assert!(evidence["/other/w"].is_empty());
+    }
+
+    #[test]
+    fn scope_middleware_is_kept_alongside_handler_evidence() {
+        let source = r#"
+            fn require_admin() {}
+            async fn users() { require_admin(); }
+            async fn orders() { require_admin(); }
+            async fn payments() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/admin").wrap(AdminMiddleware)
+                    .route("/users", web::get().to(users))
+                    .route("/orders", web::get().to(orders))
+                    .route("/payments", web::get().to(payments)));
+            }
+        "#;
+        let evidence = route_evidence(source);
+        use AuthEvidenceKind::*;
+        for path in ["/admin/users", "/admin/orders"] {
+            assert_eq!(
+                evidence[path],
+                vec![
+                    (AuthorizationMiddleware, "AdminMiddleware".to_owned()),
+                    (RoleCheck, "require_admin".to_owned()),
+                ],
+                "{path}"
+            );
+        }
+        assert_eq!(
+            evidence["/admin/payments"],
+            vec![(AuthorizationMiddleware, "AdminMiddleware".to_owned())]
+        );
+
+        // Every route is authorized by the scope middleware, so no drift remains.
+        let syntax: syn::File = syn::parse_str(source).unwrap();
+        let file = Path::new("scopes.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+        let (_, _, details, _) = build_analysis_layers(&visitor.routes);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn route_and_handler_names_alone_do_not_count_as_protection() {
+        let syntax: syn::File = syn::parse_str(
+            r#"
+            async fn require_admin_panel() {}
+            async fn admin_only() {}
+            #[get("/admin/attribute")]
+            async fn check_permission() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/admin")
+                    .route("/panel", web::get().to(require_admin_panel))
+                    .route("/secure", web::get().to(admin_only)));
+            }
+            "#,
+        )
+        .unwrap();
+        let file = Path::new("names.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+
+        assert_eq!(visitor.routes.len(), 3);
+        for route in &visitor.routes {
+            assert!(route.authorization.is_empty(), "{}", route.path);
+            assert!(!route.is_authorized(), "{}", route.path);
+        }
     }
 
     #[test]

@@ -174,6 +174,15 @@ Bare names are first resolved lexically, innermost scope first:
 - `let` bindings (after their statement), function and closure parameters, `for`/`match`/`if let`/`while let` patterns, and block `const`/`static` items shadow handler names;
 - a shadowed name, a duplicate block function, or a name hidden inside a function-local `mod` is `Unresolved`.
 
+### Authorization evidence heuristics
+
+Evidence comes from the resolved handler's body, from the route's own `.guard(...)` arguments, and from the `.guard(...)` and `.wrap(...)` calls of its scope and every enclosing scope. A scope's middleware applies to all of that scope's routes and nested scopes wherever the call appears in its builder chain, and never to sibling scopes or to a sibling route's own guards. All of it is kept: guard or middleware evidence never replaces handler evidence. Route paths and handler names are never evidence.
+
+- **Helper calls and method calls** are classified by their snake_case words. Exact names such as `require_admin`, `has_role`, `is_admin`, `check_permission`, `authorize`, and `owns` count, as do `require_`/`check_`/`verify_`/`assert_`/`ensure_` names whose words include a role (`admin`, `manager`, `role`), permission, owner, or a final `access` (`verify_resource_access`), and `authorize_*` names.
+- Names ending in a data, lookup, or logging word are not checks: `ensure_admin_exists`, `check_admin_token`, `role_name`, `permissions_list`, `check_access_log`. Token validation, user lookups, and OAuth state checks (`verify_access_token`, `check_username`, `ensure_user_exists`, `verify_oauth_state`) are not authorization.
+- Authentication helpers (`require_auth`, `is_authenticated`, `require_authenticated_user`) and identity values (`Claims`, `Identity`) are recorded as weak identity evidence, which never makes a route authorized.
+- **Guard and middleware types** need an authorization word (`admin`, `role`, `permission`, `authorization`, `acl`, `rbac`) and a guard-like word (`Guard`, `Middleware`, `Filter`, `Require`, `Check`, `Only`, ...): `AdminGuard`, `RequireAdmin`, `AdminAuthMiddleware`. Authentication-only types (`AuthMiddleware`, `AuthGuard`, `JwtGuard`, `HttpAuthentication`) are identity evidence. Error-mapping and logging types (`UnauthorizedHandler`, `AuthorizationErrorMiddleware`, `RoleLogger`) and unrelated types such as `PermissionsPolicy` are ignored. Guard functions such as `guard::fn_guard(check_admin)` use the helper-name rules.
+
 ### Conservative cases
 
 ARCHER never merges evidence from same-named functions and never guesses:
@@ -208,9 +217,10 @@ For reproducible evaluation, run ARCHER against controlled fixtures with known a
 
 ARCHER is an evolving research prototype, and its results depend on the authorization patterns and Actix-Web constructs it can recognize.
 
-- Helper recognition is a name-based heuristic; custom authorization abstractions may not be detected, and a recognized name does not prove what a helper does.
+- Helper recognition is a name-based heuristic; custom authorization abstractions may not be detected, and a recognized name does not prove what a helper does. Middleware whose name says only "auth" is treated as authentication, even if it also enforces permissions.
+- Scope middleware is linked only through builder chains in one expression: `.wrap(...)` on an `App` or scope does not reach routes registered in another function (`App::new().wrap(X).configure(routes)`) or through a `ServiceConfig` passed elsewhere.
 - Calls are not followed: a handler that calls a protected helper with an unrecognized name has no recognized evidence.
-- Not modeled: `use` declarations inside function bodies, macro-generated items and bindings, `#[path]` modules, `impl`-method handlers, cross-crate workspace dependencies, Rust 2015 crate-relative paths, scope-level `.wrap(...)` applied after routes or inherited from parent scopes, and attribute routes registered through `.service(handler)` inside a scope (their scope prefix is not applied).
+- Not modeled: `use` declarations inside function bodies, macro-generated items and bindings, `#[path]` modules, `impl`-method handlers, cross-crate workspace dependencies, Rust 2015 crate-relative paths, and attribute routes registered through `.service(handler)` inside a scope (their scope prefix is not applied).
 - `main.rs` and `lib.rs` share one namespace; same-named functions in both are `Ambiguous`.
 - Local closures used as handlers carry no evidence.
 - Structural similarity does not guarantee that two routes should have identical authorization requirements.
