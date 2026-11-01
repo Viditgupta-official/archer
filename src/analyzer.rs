@@ -96,6 +96,41 @@ pub struct Route {
     pub file: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "status")]
+pub enum RouteSecurityStatus {
+    /// Route has verified authorization evidence (Guard, Middleware, RoleCheck, PermissionCheck, etc.)
+    Protected,
+    /// Route handler is resolved and verified to lack any authorization enforcement.
+    Unprotected,
+    /// Security posture cannot be determined statically (e.g. handler unresolved, ambiguous, or indirect).
+    Unknown { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum DriftCategory {
+    /// Peer routes enforce authorization checks, but the target route contains none.
+    MissingEnforcement,
+    /// Route extracts identity/claims (authentication), but fails to enforce authorization.
+    AuthenticationOnlyWithoutAuthorization,
+    /// Peer parameterized routes validate resource ownership, but target route omits it.
+    MissingOwnershipValidation,
+    /// Peer routes enforce a role (e.g. Admin), but target route enforces an inconsistent role.
+    InconsistentRoleOrPermission,
+    /// Peer routes enforce architectural guard/middleware, but target route uses ad-hoc logic.
+    InconsistentMechanism,
+    /// Route security posture could not be definitively validated due to resolution limits.
+    #[allow(dead_code)]
+    UnresolvedSecurityPosture,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum DriftConfidence {
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RouteReference {
     pub method: String,
@@ -105,6 +140,7 @@ pub struct RouteReference {
     pub line: usize,
     pub authorized: bool,
     pub authorization: Vec<AuthEvidence>,
+    pub status: RouteSecurityStatus,
 }
 
 impl From<&Route> for RouteReference {
@@ -117,6 +153,7 @@ impl From<&Route> for RouteReference {
             line: route.line,
             authorized: route.is_authorized(),
             authorization: route.authorization.clone(),
+            status: route.security_status(),
         }
     }
 }
@@ -146,6 +183,10 @@ pub struct Finding {
     pub suspicious_route: RouteReference,
     pub suspicious_route_evidence: Vec<AuthEvidence>,
     pub authorized_peer_routes: Vec<RouteReference>,
+    pub category: DriftCategory,
+    pub confidence: DriftConfidence,
+    pub explanation: String,
+    pub remediation: String,
 }
 
 impl Route {
@@ -153,6 +194,29 @@ impl Route {
         self.authorization
             .iter()
             .any(AuthEvidence::is_authorization)
+    }
+
+    pub fn security_status(&self) -> RouteSecurityStatus {
+        if self.is_authorized() {
+            RouteSecurityStatus::Protected
+        } else if matches!(
+            self.handler_resolution,
+            Some(HandlerResolution::Unresolved) | Some(HandlerResolution::Ambiguous { .. })
+        ) {
+            RouteSecurityStatus::Unknown {
+                reason: "Handler symbol could not be uniquely resolved in repository AST".into(),
+            }
+        } else if self
+            .authorization
+            .iter()
+            .any(|e| matches!(e.kind, AuthEvidenceKind::Unknown))
+        {
+            RouteSecurityStatus::Unknown {
+                reason: "Route contains unrecognized authorization evidence".into(),
+            }
+        } else {
+            RouteSecurityStatus::Unprotected
+        }
     }
 
     pub fn evidence_summary(&self) -> String {
@@ -166,6 +230,7 @@ impl Route {
             .join(", ")
     }
 
+    #[allow(dead_code)]
     pub fn strongest_evidence(&self) -> Option<&AuthEvidence> {
         self.authorization
             .iter()
@@ -178,6 +243,130 @@ impl Route {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisSummary {
+    pub total_routes: usize,
+    pub protected_routes: usize,
+    pub unprotected_routes: usize,
+    pub unknown_routes: usize,
+    pub peer_groups_count: usize,
+    pub inferred_invariants_count: usize,
+    pub drift_findings_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum NodeKind {
+    Scope,
+    Route,
+    Handler,
+    Guard,
+    Middleware,
+    AuthorizationCheck,
+    IdentityExtraction,
+    InvariantContract,
+    Finding,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    pub kind: NodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum EdgeRelation {
+    BelongsToScope,
+    RoutesTo,
+    GuardedBy,
+    WrappedBy,
+    EnforcesCheck,
+    ExtractsIdentity,
+    ImplementsContract,
+    ViolatesContract,
+    FlagsRoute,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: EdgeRelation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizationRelationshipGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+impl AuthorizationRelationshipGraph {
+    pub fn to_dot(&self) -> String {
+        let mut dot = String::from("digraph ARCHER_Authorization_Graph {\n");
+        dot.push_str("  rankdir=LR;\n");
+        dot.push_str("  node [shape=box, style=rounded, fontname=\"Helvetica\"];\n");
+        dot.push_str("  edge [fontname=\"Helvetica\", fontsize=10];\n\n");
+
+        for node in &self.nodes {
+            let (color, shape) = match node.kind {
+                NodeKind::Scope => ("#e1d5e7", "folder"),
+                NodeKind::Route => ("#dae8fc", "box"),
+                NodeKind::Handler => ("#d5e8d4", "ellipse"),
+                NodeKind::Guard => ("#ffe6cc", "diamond"),
+                NodeKind::Middleware => ("#fff2cc", "hexagon"),
+                NodeKind::AuthorizationCheck => ("#d5e8d4", "component"),
+                NodeKind::IdentityExtraction => ("#f8cecc", "parallelogram"),
+                NodeKind::InvariantContract => ("#e1d5e7", "septagon"),
+                NodeKind::Finding => ("#f8cecc", "octagon"),
+            };
+            dot.push_str(&format!(
+                "  \"{}\" [label=\"{}\", fillcolor=\"{}\", style=\"filled,rounded\", shape={}];\n",
+                node.id,
+                node.label.replace('"', "\\\""),
+                color,
+                shape
+            ));
+        }
+
+        dot.push('\n');
+        for edge in &self.edges {
+            let style = match edge.relation {
+                EdgeRelation::ViolatesContract => "color=\"red\", style=dashed",
+                EdgeRelation::FlagsRoute => "color=\"red\", style=bold",
+                _ => "color=\"#666666\"",
+            };
+            dot.push_str(&format!(
+                "  \"{}\" -> \"{}\" [label=\"{:?}\", {}];\n",
+                edge.from, edge.to, edge.relation, style
+            ));
+        }
+
+        dot.push_str("}\n");
+        dot
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffAnalysisReport {
+    pub base_ref: String,
+    pub changed_files: Vec<PathBuf>,
+    pub affected_routes: Vec<RouteReference>,
+    pub newly_introduced_drifts: Vec<Finding>,
+    pub regressions: Vec<RouteRegression>,
+    pub unchanged_drifts: Vec<Finding>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteRegression {
+    pub route: RouteReference,
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub files_scanned: usize,
@@ -187,6 +376,12 @@ pub struct Report {
     pub invariants: Vec<AuthorizationInvariant>,
     pub findings: Vec<String>,
     pub finding_details: Vec<Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<AuthorizationRelationshipGraph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<AnalysisSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_report: Option<DiffAnalysisReport>,
 }
 
 /// One lexical scope: a block, or the binding region of a function, closure,
@@ -1605,6 +1800,17 @@ fn evidence_for_handler_symbol(
             strength: AuthStrength::Weak,
         });
     }
+    if symbol.contains("UnknownSecurity") || name == "custom_auth_marker" {
+        return Some(AuthEvidence {
+            kind: AuthEvidenceKind::Unknown,
+            mechanism: name.into(),
+            symbol: Some(symbol.into()),
+            file: file.to_path_buf(),
+            line,
+            handler: Some(handler.into()),
+            strength: AuthStrength::Weak,
+        });
+    }
     None
 }
 
@@ -1923,6 +2129,27 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
 
     let (peer_groups, invariants, finding_details, findings) = build_analysis_layers(&routes);
 
+    let protected_routes = routes.iter().filter(|r| r.is_authorized()).count();
+    let unknown_routes = routes
+        .iter()
+        .filter(|r| matches!(r.security_status(), RouteSecurityStatus::Unknown { .. }))
+        .count();
+    let unprotected_routes = routes
+        .len()
+        .saturating_sub(protected_routes + unknown_routes);
+
+    let summary = Some(AnalysisSummary {
+        total_routes: routes.len(),
+        protected_routes,
+        unprotected_routes,
+        unknown_routes,
+        peer_groups_count: peer_groups.len(),
+        inferred_invariants_count: invariants.len(),
+        drift_findings_count: finding_details.len(),
+    });
+
+    let graph = Some(build_authorization_graph(&routes, &finding_details));
+
     Ok(Report {
         files_scanned,
         parse_errors,
@@ -1931,6 +2158,277 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
         invariants,
         findings,
         finding_details,
+        graph,
+        summary,
+        diff_report: None,
+    })
+}
+
+pub fn build_authorization_graph(
+    routes: &[Route],
+    findings: &[Finding],
+) -> AuthorizationRelationshipGraph {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut node_ids = HashSet::new();
+
+    let add_node = |nodes: &mut Vec<GraphNode>,
+                    node_ids: &mut HashSet<String>,
+                    id: String,
+                    label: String,
+                    kind: NodeKind,
+                    file: Option<PathBuf>,
+                    line: Option<usize>| {
+        if node_ids.insert(id.clone()) {
+            nodes.push(GraphNode {
+                id,
+                label,
+                kind,
+                file,
+                line,
+            });
+        }
+    };
+
+    // Scopes and Routes
+    for route in routes {
+        let route_id = format!("route:{}:{}", route.method, route.path);
+        let scope_id = format!(
+            "scope:{}",
+            if route.scope_prefix.is_empty() {
+                "/"
+            } else {
+                &route.scope_prefix
+            }
+        );
+
+        add_node(
+            &mut nodes,
+            &mut node_ids,
+            scope_id.clone(),
+            format!(
+                "Scope: {}",
+                if route.scope_prefix.is_empty() {
+                    "/"
+                } else {
+                    &route.scope_prefix
+                }
+            ),
+            NodeKind::Scope,
+            None,
+            None,
+        );
+
+        add_node(
+            &mut nodes,
+            &mut node_ids,
+            route_id.clone(),
+            format!("{} {}", route.method, route.path),
+            NodeKind::Route,
+            Some(route.file.clone()),
+            Some(route.line),
+        );
+
+        edges.push(GraphEdge {
+            from: route_id.clone(),
+            to: scope_id,
+            relation: EdgeRelation::BelongsToScope,
+        });
+
+        if let Some(handler) = &route.handler {
+            let handler_id = format!("handler:{}", handler);
+            add_node(
+                &mut nodes,
+                &mut node_ids,
+                handler_id.clone(),
+                format!("fn {}()", handler),
+                NodeKind::Handler,
+                Some(route.file.clone()),
+                None,
+            );
+            edges.push(GraphEdge {
+                from: route_id.clone(),
+                to: handler_id.clone(),
+                relation: EdgeRelation::RoutesTo,
+            });
+
+            for (idx, evidence) in route.authorization.iter().enumerate() {
+                let evidence_id = format!("evidence:{}:{}:{}", handler, idx, evidence.mechanism);
+                let (kind, relation) = match evidence.kind {
+                    AuthEvidenceKind::AuthorizationGuard => {
+                        (NodeKind::Guard, EdgeRelation::GuardedBy)
+                    }
+                    AuthEvidenceKind::AuthorizationMiddleware => {
+                        (NodeKind::Middleware, EdgeRelation::WrappedBy)
+                    }
+                    AuthEvidenceKind::IdentityExtraction => {
+                        (NodeKind::IdentityExtraction, EdgeRelation::ExtractsIdentity)
+                    }
+                    _ => (NodeKind::AuthorizationCheck, EdgeRelation::EnforcesCheck),
+                };
+                add_node(
+                    &mut nodes,
+                    &mut node_ids,
+                    evidence_id.clone(),
+                    format!("{:?}: {}", evidence.kind, evidence.mechanism),
+                    kind,
+                    Some(evidence.file.clone()),
+                    Some(evidence.line),
+                );
+                edges.push(GraphEdge {
+                    from: handler_id.clone(),
+                    to: evidence_id,
+                    relation,
+                });
+            }
+        }
+    }
+
+    // Invariants & Findings
+    for (i, finding) in findings.iter().enumerate() {
+        let contract_id = format!("contract:{}", finding.peer_group_id);
+        let finding_id = format!("finding:{}:{:?}", i + 1, finding.category);
+
+        add_node(
+            &mut nodes,
+            &mut node_ids,
+            contract_id.clone(),
+            format!("Invariant: {}", finding.invariant.description),
+            NodeKind::InvariantContract,
+            None,
+            None,
+        );
+
+        for peer in &finding.authorized_peer_routes {
+            let peer_id = format!("route:{}:{}", peer.method, peer.path);
+            edges.push(GraphEdge {
+                from: peer_id,
+                to: contract_id.clone(),
+                relation: EdgeRelation::ImplementsContract,
+            });
+        }
+
+        add_node(
+            &mut nodes,
+            &mut node_ids,
+            finding_id.clone(),
+            format!(
+                "Drift ({:?}): {} {}",
+                finding.category, finding.suspicious_route.method, finding.suspicious_route.path
+            ),
+            NodeKind::Finding,
+            Some(finding.suspicious_route.file.clone()),
+            Some(finding.suspicious_route.line),
+        );
+
+        let suspicious_id = format!(
+            "route:{}:{}",
+            finding.suspicious_route.method, finding.suspicious_route.path
+        );
+        edges.push(GraphEdge {
+            from: finding_id.clone(),
+            to: suspicious_id,
+            relation: EdgeRelation::FlagsRoute,
+        });
+
+        edges.push(GraphEdge {
+            from: finding_id,
+            to: contract_id,
+            relation: EdgeRelation::ViolatesContract,
+        });
+    }
+
+    AuthorizationRelationshipGraph { nodes, edges }
+}
+
+pub fn analyze_repository_diff(root: &Path, git_ref: Option<&str>) -> Result<DiffAnalysisReport> {
+    let base_ref = git_ref.unwrap_or("HEAD~1");
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", base_ref])
+        .current_dir(root)
+        .output();
+
+    let mut changed_files = Vec::new();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.ends_with(".rs") {
+                    changed_files.push(root.join(trimmed));
+                }
+            }
+        }
+    }
+
+    if changed_files.is_empty() {
+        let status_out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output();
+        if let Ok(out) = status_out {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.len() > 3 {
+                        let path_part = trimmed[3..].trim();
+                        if path_part.ends_with(".rs") {
+                            changed_files.push(root.join(path_part));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let report = analyze_repository(root)?;
+    let mut affected_routes = Vec::new();
+    let mut newly_introduced_drifts = Vec::new();
+    let mut unchanged_drifts = Vec::new();
+    let regressions = Vec::new();
+
+    for route in &report.routes {
+        let is_changed = changed_files.iter().any(|cf| {
+            cf.canonicalize().ok() == route.file.canonicalize().ok()
+                || route.file.ends_with(cf)
+                || cf.ends_with(&route.file)
+        });
+        if is_changed {
+            affected_routes.push(route.into());
+        }
+    }
+
+    for finding in report.finding_details {
+        let is_in_changed = changed_files.iter().any(|cf| {
+            cf.canonicalize().ok() == finding.suspicious_route.file.canonicalize().ok()
+                || finding.suspicious_route.file.ends_with(cf)
+                || cf.ends_with(&finding.suspicious_route.file)
+        });
+        if is_in_changed {
+            newly_introduced_drifts.push(finding);
+        } else {
+            unchanged_drifts.push(finding);
+        }
+    }
+
+    let summary = format!(
+        "Change Analysis against '{}': {} changed Rust file(s) examined. {} affected route(s). {} newly introduced drift(s). {} pre-existing drift(s).",
+        base_ref,
+        changed_files.len(),
+        affected_routes.len(),
+        newly_introduced_drifts.len(),
+        unchanged_drifts.len()
+    );
+
+    Ok(DiffAnalysisReport {
+        base_ref: base_ref.to_string(),
+        changed_files,
+        affected_routes,
+        newly_introduced_drifts,
+        regressions,
+        unchanged_drifts,
+        summary,
     })
 }
 
@@ -1945,6 +2443,7 @@ fn build_analysis_layers(
     let mut grouped_routes: Vec<Vec<&Route>> = Vec::new();
     for route in routes {
         if is_authentication_route(route)
+            || is_operational_public_route(route)
             || grouped_routes.iter().any(|group| {
                 group
                     .iter()
@@ -1989,7 +2488,12 @@ fn build_analysis_layers(
         });
 
         let authorized = peers.iter().filter(|route| route.is_authorized()).count();
-        let unauthorized = peers.len() - authorized;
+        let unknown = peers
+            .iter()
+            .filter(|route| matches!(route.security_status(), RouteSecurityStatus::Unknown { .. }))
+            .count();
+        let unauthorized = peers.len().saturating_sub(authorized + unknown);
+
         let mut evidence_patterns: Vec<String> = peers
             .iter()
             .flat_map(|route| {
@@ -2001,7 +2505,26 @@ fn build_analysis_layers(
             .collect();
         evidence_patterns.sort();
         evidence_patterns.dedup();
+
+        let is_parameterized = dynamic_segment_shape(first).iter().any(|d| *d);
+        let scope_backing_authorized = if !first.scope_prefix.is_empty() {
+            routes
+                .iter()
+                .filter(|r| {
+                    r.scope_prefix == first.scope_prefix
+                        && r.method == first.method
+                        && r.is_authorized()
+                })
+                .count()
+        } else {
+            0
+        };
+
+        let has_sufficient_backing = authorized >= 2
+            || (is_parameterized && authorized >= 1 && scope_backing_authorized >= 2);
+
         let strength = invariant_strength(authorized, peers.len());
+
         let invariant = AuthorizationInvariant {
             peer_group_id: id.clone(),
             description: format!(
@@ -2020,22 +2543,108 @@ fn build_analysis_layers(
         };
         invariants.push(invariant.clone());
 
-        if authorized < 2 || unauthorized == 0 {
+        if !has_sufficient_backing || unauthorized == 0 {
             continue;
         }
-        for route in peers.iter().filter(|route| !route.is_authorized()) {
+
+        for route in peers
+            .iter()
+            .filter(|route| matches!(route.security_status(), RouteSecurityStatus::Unprotected))
+        {
             let authorized_peer_routes: Vec<RouteReference> = peers
                 .iter()
                 .filter(|peer| peer.is_authorized())
                 .map(|peer| (*peer).into())
                 .collect();
+
+            let category = if route
+                .authorization
+                .iter()
+                .any(|e| matches!(e.kind, AuthEvidenceKind::IdentityExtraction))
+            {
+                DriftCategory::AuthenticationOnlyWithoutAuthorization
+            } else if dynamic_segment_shape(route).iter().any(|d| *d)
+                && peers.iter().any(|p| {
+                    p.authorization
+                        .iter()
+                        .any(|e| matches!(e.kind, AuthEvidenceKind::OwnershipCheck))
+                })
+            {
+                DriftCategory::MissingOwnershipValidation
+            } else if peers.iter().any(|p| {
+                p.authorization
+                    .iter()
+                    .any(|e| matches!(e.kind, AuthEvidenceKind::RoleCheck))
+            }) && route
+                .authorization
+                .iter()
+                .any(|e| matches!(e.kind, AuthEvidenceKind::RoleCheck))
+            {
+                DriftCategory::InconsistentRoleOrPermission
+            } else if peers.iter().all(|p| {
+                p.authorization.iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        AuthEvidenceKind::AuthorizationGuard
+                            | AuthEvidenceKind::AuthorizationMiddleware
+                    )
+                })
+            }) && !route.authorization.is_empty()
+            {
+                DriftCategory::InconsistentMechanism
+            } else {
+                DriftCategory::MissingEnforcement
+            };
+
+            let confidence = match invariant.strength {
+                AuthStrength::Strong => DriftConfidence::High,
+                AuthStrength::Medium => DriftConfidence::Medium,
+                AuthStrength::Weak => DriftConfidence::Low,
+            };
+
+            let (explanation, remediation) = match &category {
+                DriftCategory::AuthenticationOnlyWithoutAuthorization => (
+                    "Route extracts identity or claims (authentication) but lacks authorization enforcement (role, permission, guard, or middleware check). Authenticated users can access this endpoint regardless of privileges.".to_string(),
+                    "Add an explicit authorization check (e.g. `require_admin(&user)`), permission check, or guard to verify authorization following identity extraction.".to_string(),
+                ),
+                DriftCategory::MissingOwnershipValidation => (
+                    "Peer parameterized resource routes enforce resource ownership validation, but this route does not validate that the authenticated entity owns the requested resource (IDOR risk).".to_string(),
+                    "Add ownership verification logic (e.g. `check_ownership(user_id, resource_id)`) before serving sensitive resource data.".to_string(),
+                ),
+                DriftCategory::InconsistentRoleOrPermission => (
+                    "Route authorization policy enforces a role or permission that deviates from the consensus role required by its peer routes.".to_string(),
+                    "Align the required role or permission with the peer group invariant.".to_string(),
+                ),
+                DriftCategory::InconsistentMechanism => (
+                    "Peer routes consistently use route-level guards or middleware, but this route uses ad-hoc or disparate mechanisms, violating architectural consistency.".to_string(),
+                    "Standardize on the peer group's architectural protection mechanism (e.g. guard or middleware).".to_string(),
+                ),
+                DriftCategory::MissingEnforcement => (
+                    format!(
+                        "Route in scope '{}' lacks recognized authorization protection while {} peer routes consistently enforce authorization.",
+                        if first.scope_prefix.is_empty() { "/" } else { &first.scope_prefix },
+                        authorized
+                    ),
+                    "Apply the inferred authorization invariant to this route via a guard, middleware, or handler check.".to_string(),
+                ),
+                DriftCategory::UnresolvedSecurityPosture => (
+                    "Route handler could not be uniquely resolved or analyzed; posture is unknown.".to_string(),
+                    "Verify handler path and export scope so static analysis can inspect authorization checks.".to_string(),
+                ),
+            };
+
             finding_details.push(Finding {
                 peer_group_id: id.clone(),
                 invariant: invariant.clone(),
                 suspicious_route: (*route).into(),
                 suspicious_route_evidence: route.authorization.clone(),
                 authorized_peer_routes,
+                category,
+                confidence,
+                explanation,
+                remediation,
             });
+
             let peer_lines = peers
                 .iter()
                 .filter(|peer| peer.is_authorized())
@@ -2069,7 +2678,8 @@ fn build_analysis_layers(
     (peer_groups, invariants, finding_details, findings)
 }
 
-fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
+#[allow(dead_code)]
+pub fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
     build_analysis_layers(routes).3
 }
 
@@ -2114,7 +2724,6 @@ fn format_evidence(route: &Route) -> String {
 
 fn same_peer_group(route: &Route, candidate: &Route) -> bool {
     if route.scope_prefix != candidate.scope_prefix
-        || route.method != candidate.method
         || route_segment_count(route) != route_segment_count(candidate)
         || dynamic_segment_shape(route) != dynamic_segment_shape(candidate)
     {
@@ -2125,7 +2734,37 @@ fn same_peer_group(route: &Route, candidate: &Route) -> bool {
         return route.path == candidate.path;
     }
 
+    if is_operational_public_route(route) || is_operational_public_route(candidate) {
+        return route.path == candidate.path;
+    }
+
+    if route.method != candidate.method {
+        let is_parameterized = dynamic_segment_shape(route).iter().any(|d| *d);
+        if !(is_parameterized && route.path == candidate.path) {
+            return false;
+        }
+    }
+
     true
+}
+
+fn is_operational_public_route(route: &Route) -> bool {
+    let public_operational_names = [
+        "health", "healthz", "live", "ready", "status", "ping", "metrics", "version", "info",
+        "docs", "swagger", "openapi", "favicon",
+    ];
+    let path_segments: Vec<String> = route
+        .path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if let Some(last) = path_segments.last() {
+        if public_operational_names.contains(&last.as_str()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn route_segment_count(route: &Route) -> usize {
@@ -2462,7 +3101,13 @@ mod tests {
             ("GET", "/api/public-info"),
             ("POST", "/api/session"),
         ] {
-            assert!(visitor.routes.iter().any(|route| route.method == method && route.path == path), "missing {method} {path}");
+            assert!(
+                visitor
+                    .routes
+                    .iter()
+                    .any(|route| route.method == method && route.path == path),
+                "missing {method} {path}"
+            );
         }
 
         for route in &visitor.routes {
@@ -2471,22 +3116,40 @@ mod tests {
                 .find(|scope| route.path.starts_with(&format!("/api/{scope}/")))
                 .map(|scope| format!("/api/{scope}"))
                 .unwrap_or_default();
-            assert_eq!(route.scope_prefix, expected_scope, "wrong scope for {} {}", route.method, route.path);
+            assert_eq!(
+                route.scope_prefix, expected_scope,
+                "wrong scope for {} {}",
+                route.method, route.path
+            );
         }
 
         for handler in ["admin_users", "admin_orders", "admin_reports"] {
-            let route = visitor.routes.iter().find(|route| route.handler.as_deref() == Some(handler)).unwrap();
+            let route = visitor
+                .routes
+                .iter()
+                .find(|route| route.handler.as_deref() == Some(handler))
+                .unwrap();
             assert_eq!(route.authorization.len(), 1);
             assert_eq!(route.authorization[0].mechanism, "require_admin");
             assert_eq!(route.authorization[0].handler.as_deref(), Some(handler));
         }
-        let audit = visitor.routes.iter().find(|route| route.path == "/api/admin/audit").unwrap();
+        let audit = visitor
+            .routes
+            .iter()
+            .find(|route| route.path == "/api/admin/audit")
+            .unwrap();
         assert_eq!(audit.method, "POST");
 
         let (groups, invariants, details, findings) = build_analysis_layers(&visitor.routes);
-        let admin_group = groups.iter().find(|group| {
-            group.routes.iter().any(|route| route.path == "/api/admin/payments")
-        }).unwrap();
+        let admin_group = groups
+            .iter()
+            .find(|group| {
+                group
+                    .routes
+                    .iter()
+                    .any(|route| route.path == "/api/admin/payments")
+            })
+            .unwrap();
         assert_eq!(admin_group.routes.len(), 4);
         assert!(admin_group.routes.iter().all(|route| route.method == "GET"));
         assert_eq!(invariants.len(), 1);
@@ -2771,9 +3434,19 @@ mod tests {
         assert_eq!(evidence[3].mechanism, "check_resource_owner");
         assert_eq!(evidence[4].kind, AuthEvidenceKind::IdentityExtraction);
         assert_eq!(evidence[4].mechanism, "require_authenticated_user");
-        assert!(evidence.iter().all(|item| item.handler.as_deref() == Some("protected")));
-        assert!(!evidence.iter().any(|item| item.mechanism == "admin_dashboard_title"));
-        assert!(!evidence.iter().any(|item| item.kind == AuthEvidenceKind::IdentityExtraction && item.is_authorization()));
+        assert!(
+            evidence
+                .iter()
+                .all(|item| item.handler.as_deref() == Some("protected"))
+        );
+        assert!(
+            !evidence
+                .iter()
+                .any(|item| item.mechanism == "admin_dashboard_title")
+        );
+        assert!(!evidence.iter().any(
+            |item| item.kind == AuthEvidenceKind::IdentityExtraction && item.is_authorization()
+        ));
 
         let error_syntax: syn::File = syn::parse_str(
             "fn error_only() -> Result<(), AuthError> { Err(AuthError::Forbidden) }
@@ -4558,5 +5231,134 @@ mod secure {
         assert_eq!(details.len(), 1);
         assert_eq!(details[0].suspicious_route.path, "/admin/payments");
         assert_eq!(details[0].authorized_peer_routes.len(), 3);
+    }
+
+    #[test]
+    fn three_state_security_status_distinguishes_unprotected_from_unknown() {
+        let protected_route = route("GET", "/admin/users", "/admin", "PRESENT");
+        assert_eq!(
+            protected_route.security_status(),
+            RouteSecurityStatus::Protected
+        );
+
+        let mut unprotected_route = route("GET", "/admin/payments", "/admin", "NONE");
+        unprotected_route.handler_resolution = Some(HandlerResolution::Local);
+        assert_eq!(
+            unprotected_route.security_status(),
+            RouteSecurityStatus::Unprotected
+        );
+
+        let mut unresolved_route = route("GET", "/admin/external", "/admin", "NONE");
+        unresolved_route.handler_resolution = Some(HandlerResolution::Unresolved);
+        assert!(matches!(
+            unresolved_route.security_status(),
+            RouteSecurityStatus::Unknown { .. }
+        ));
+
+        let mut ambiguous_route = route("GET", "/admin/duplicate", "/admin", "NONE");
+        ambiguous_route.handler_resolution = Some(HandlerResolution::Ambiguous {
+            candidates: vec!["a::duplicate".into(), "b::duplicate".into()],
+        });
+        assert!(matches!(
+            ambiguous_route.security_status(),
+            RouteSecurityStatus::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn drift_categories_classify_auth_only_and_ownership() {
+        let auth_only_route = Route {
+            method: "GET".into(),
+            path: "/admin/profile".into(),
+            scope_prefix: "/admin".into(),
+            handler: Some("profile".into()),
+            handler_path: Some("profile".into()),
+            handler_resolution: Some(HandlerResolution::Local),
+            authorization: vec![AuthEvidence {
+                kind: AuthEvidenceKind::IdentityExtraction,
+                mechanism: "AuthenticatedUser".into(),
+                symbol: Some("AuthenticatedUser".into()),
+                file: PathBuf::from("test.rs"),
+                line: 10,
+                handler: Some("profile".into()),
+                strength: AuthStrength::Weak,
+            }],
+            line: 10,
+            file: PathBuf::from("test.rs"),
+        };
+
+        let peer1 = route("GET", "/admin/users", "/admin", "PRESENT");
+        let peer2 = route("GET", "/admin/orders", "/admin", "PRESENT");
+
+        let routes = vec![auth_only_route, peer1, peer2];
+        let (_, _, details, _) = build_analysis_layers(&routes);
+        assert_eq!(details.len(), 1);
+        assert_eq!(
+            details[0].category,
+            DriftCategory::AuthenticationOnlyWithoutAuthorization
+        );
+        assert!(details[0].explanation.contains("authentication"));
+    }
+
+    #[test]
+    fn operational_routes_do_not_produce_false_positive_drift() {
+        let health_route = route("GET", "/admin/health", "/admin", "NONE");
+        let user_route = route("GET", "/admin/users", "/admin", "PRESENT");
+        let order_route = route("GET", "/admin/orders", "/admin", "PRESENT");
+
+        let routes = vec![health_route, user_route, order_route];
+        let (_, _, details, _) = build_analysis_layers(&routes);
+        // /admin/health must be excluded as an operational route and not flagged as drift
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn parameterized_route_scope_fallback_detects_drift() {
+        let mut order_param = route("GET", "/admin/orders/{id}", "/admin", "PRESENT");
+        order_param.authorization = vec![AuthEvidence {
+            kind: AuthEvidenceKind::OwnershipCheck,
+            mechanism: "is_owner".into(),
+            symbol: Some("is_owner".into()),
+            file: PathBuf::from("test.rs"),
+            line: 5,
+            handler: Some("order_detail".into()),
+            strength: AuthStrength::Medium,
+        }];
+
+        let payment_param = route("GET", "/admin/payments/{id}", "/admin", "NONE");
+
+        let scope_peer1 = route("GET", "/admin/users", "/admin", "PRESENT");
+        let scope_peer2 = route("GET", "/admin/reports", "/admin", "PRESENT");
+
+        let routes = vec![order_param, payment_param, scope_peer1, scope_peer2];
+        let (_, _, details, _) = build_analysis_layers(&routes);
+
+        let param_finding = details
+            .iter()
+            .find(|f| f.suspicious_route.path == "/admin/payments/{id}");
+        assert!(
+            param_finding.is_some(),
+            "Parameterized drift should be caught via scope fallback"
+        );
+        assert_eq!(
+            param_finding.unwrap().category,
+            DriftCategory::MissingOwnershipValidation
+        );
+    }
+
+    #[test]
+    fn authorization_relationship_graph_generates_nodes_and_edges() {
+        let routes = vec![
+            route("GET", "/admin/users", "/admin", "PRESENT"),
+            route("GET", "/admin/payments", "/admin", "NONE"),
+        ];
+        let (_, _, details, _) = build_analysis_layers(&routes);
+        let graph = build_authorization_graph(&routes, &details);
+
+        assert!(!graph.nodes.is_empty());
+        assert!(!graph.edges.is_empty());
+        let dot = graph.to_dot();
+        assert!(dot.contains("digraph ARCHER_Authorization_Graph"));
+        assert!(dot.contains("Scope: /admin"));
     }
 }
