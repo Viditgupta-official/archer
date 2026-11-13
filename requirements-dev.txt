@@ -1,0 +1,3 @@
+# Optional live HTTP/OpenAPI contract tests only; no Python runtime dependency.
+openapi-spec-validator==0.9.0
+jsonschema==4.26.0
