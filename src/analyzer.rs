@@ -15,6 +15,23 @@ use syn::{
 };
 use walkdir::WalkDir;
 
+// Active production stages: discovery/indexing below -> registration ->
+// security assessment -> policy_drift discovery/groups/invariants/findings.
+// reporting consumes results; legacy is never compiled into production.
+mod reporting;
+pub use reporting::{analyze_repository_diff, build_authorization_graph};
+#[cfg(test)]
+mod legacy;
+#[cfg(test)]
+use legacy::*;
+mod policy_drift;
+#[cfg(test)]
+mod policy_drift_tests;
+mod registration;
+#[cfg(test)]
+mod registration_security_tests;
+mod security;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum AuthEvidenceKind {
     RoleCheck,
@@ -85,6 +102,7 @@ pub enum HandlerResolution {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Route {
+    pub application: Option<String>,
     pub method: String,
     pub path: String,
     pub scope_prefix: String,
@@ -96,8 +114,45 @@ pub struct Route {
     pub file: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "status")]
+pub enum RouteSecurityStatus {
+    /// Route has verified authorization evidence (Guard, Middleware, RoleCheck, PermissionCheck, etc.)
+    Protected,
+    /// Route handler is resolved and verified to lack any authorization enforcement.
+    Unprotected,
+    /// Security posture cannot be determined statically (e.g. handler unresolved, ambiguous, or indirect).
+    Unknown { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum DriftCategory {
+    /// Peer routes enforce authorization checks, but the target route contains none.
+    MissingEnforcement,
+    /// Route extracts identity/claims (authentication), but fails to enforce authorization.
+    AuthenticationOnlyWithoutAuthorization,
+    /// Peer parameterized routes validate resource ownership, but target route omits it.
+    MissingOwnershipValidation,
+    /// Peer routes enforce a role (e.g. Admin), but target route enforces an inconsistent role.
+    InconsistentRoleOrPermission,
+    /// Peer routes enforce architectural guard/middleware, but target route uses ad-hoc logic.
+    InconsistentMechanism,
+    /// Route security posture could not be definitively validated due to resolution limits.
+    #[allow(dead_code)]
+    UnresolvedSecurityPosture,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum DriftConfidence {
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RouteReference {
+    pub scope_prefix: String,
+    pub application: Option<String>,
     pub method: String,
     pub path: String,
     pub handler: Option<String>,
@@ -105,11 +160,14 @@ pub struct RouteReference {
     pub line: usize,
     pub authorized: bool,
     pub authorization: Vec<AuthEvidence>,
+    pub status: RouteSecurityStatus,
 }
 
 impl From<&Route> for RouteReference {
     fn from(route: &Route) -> Self {
         Self {
+            scope_prefix: route.scope_prefix.clone(),
+            application: route.application.clone(),
             method: route.method.clone(),
             path: route.path.clone(),
             handler: route.handler.clone(),
@@ -117,6 +175,7 @@ impl From<&Route> for RouteReference {
             line: route.line,
             authorized: route.is_authorized(),
             authorization: route.authorization.clone(),
+            status: route.security_status(),
         }
     }
 }
@@ -146,6 +205,10 @@ pub struct Finding {
     pub suspicious_route: RouteReference,
     pub suspicious_route_evidence: Vec<AuthEvidence>,
     pub authorized_peer_routes: Vec<RouteReference>,
+    pub category: DriftCategory,
+    pub confidence: DriftConfidence,
+    pub explanation: String,
+    pub remediation: String,
 }
 
 impl Route {
@@ -153,6 +216,41 @@ impl Route {
         self.authorization
             .iter()
             .any(AuthEvidence::is_authorization)
+    }
+
+    pub fn security_status(&self) -> RouteSecurityStatus {
+        if matches!(self.handler_resolution, Some(HandlerResolution::Definition))
+            && self
+                .application
+                .as_ref()
+                .is_none_or(|app| app.starts_with("declaration:"))
+        {
+            // An attribute declares a service, not its effective App/scope.
+            // Keep body evidence, but do not certify security at an unknown mount.
+            RouteSecurityStatus::Unknown {
+                reason: "Attribute service has no verified application/middleware mount context"
+                    .into(),
+            }
+        } else if self.is_authorized() {
+            RouteSecurityStatus::Protected
+        } else if matches!(
+            self.handler_resolution,
+            Some(HandlerResolution::Unresolved) | Some(HandlerResolution::Ambiguous { .. })
+        ) {
+            RouteSecurityStatus::Unknown {
+                reason: "Handler symbol could not be uniquely resolved in repository AST".into(),
+            }
+        } else if self
+            .authorization
+            .iter()
+            .any(|e| matches!(e.kind, AuthEvidenceKind::Unknown))
+        {
+            RouteSecurityStatus::Unknown {
+                reason: "Route contains unrecognized authorization evidence".into(),
+            }
+        } else {
+            RouteSecurityStatus::Unprotected
+        }
     }
 
     pub fn evidence_summary(&self) -> String {
@@ -166,6 +264,7 @@ impl Route {
             .join(", ")
     }
 
+    #[allow(dead_code)]
     pub fn strongest_evidence(&self) -> Option<&AuthEvidence> {
         self.authorization
             .iter()
@@ -178,8 +277,181 @@ impl Route {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisSummary {
+    pub total_routes: usize,
+    pub peer_group_covered_routes: usize,
+    pub peer_compared_routes: usize,
+    pub routes_without_peer_comparison: usize,
+    pub protected_routes: usize,
+    pub unprotected_routes: usize,
+    pub unknown_routes: usize,
+    pub peer_groups_count: usize,
+    pub inferred_invariants_count: usize,
+    pub drift_findings_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum NodeKind {
+    Scope,
+    Route,
+    Handler,
+    Guard,
+    Middleware,
+    AuthorizationCheck,
+    IdentityExtraction,
+    InvariantContract,
+    Finding,
+    UnresolvedCheck,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    pub kind: NodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum EdgeRelation {
+    BelongsToScope,
+    RoutesTo,
+    GuardedBy,
+    WrappedBy,
+    EnforcesCheck,
+    ExtractsIdentity,
+    ImplementsContract,
+    ViolatesContract,
+    FlagsRoute,
+    UnresolvedEvidence,
+    PotentialEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: EdgeRelation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizationRelationshipGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+fn dot_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\r', "\\r").replace('\n', "\\n")
+}
+
+impl AuthorizationRelationshipGraph {
+    pub fn to_dot(&self) -> String {
+        let mut dot = String::from("digraph ARCHER_Authorization_Graph {\n");
+        dot.push_str("  rankdir=LR;\n");
+        dot.push_str("  node [shape=box, style=rounded, fontname=\"Helvetica\"];\n");
+        dot.push_str("  edge [fontname=\"Helvetica\", fontsize=10];\n\n");
+
+        for node in &self.nodes {
+            let (color, shape) = match node.kind {
+                NodeKind::Scope => ("#e1d5e7", "folder"),
+                NodeKind::Route => ("#dae8fc", "box"),
+                NodeKind::Handler => ("#d5e8d4", "ellipse"),
+                NodeKind::Guard => ("#ffe6cc", "diamond"),
+                NodeKind::Middleware => ("#fff2cc", "hexagon"),
+                NodeKind::AuthorizationCheck => ("#d5e8d4", "component"),
+                NodeKind::IdentityExtraction => ("#f8cecc", "parallelogram"),
+                NodeKind::InvariantContract => ("#e1d5e7", "septagon"),
+                NodeKind::Finding => ("#f8cecc", "octagon"),
+                NodeKind::UnresolvedCheck => ("#eeeeee", "diamond"),
+            };
+            dot.push_str(&format!(
+                "  \"{}\" [label=\"{}\", fillcolor=\"{}\", style=\"filled,rounded\", shape={}];\n",
+                dot_escape(&node.id),
+                dot_escape(&node.label),
+                color,
+                shape
+            ));
+        }
+
+        dot.push('\n');
+        for edge in &self.edges {
+            let style = match edge.relation {
+                EdgeRelation::ViolatesContract => "color=\"red\", style=dashed",
+                EdgeRelation::FlagsRoute => "color=\"red\", style=bold",
+                _ => "color=\"#666666\"",
+            };
+            dot.push_str(&format!(
+                "  \"{}\" -> \"{}\" [label=\"{:?}\", {}];\n",
+                dot_escape(&edge.from), dot_escape(&edge.to), edge.relation, style
+            ));
+        }
+
+        dot.push_str("}\n");
+        dot
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffAnalysisReport {
+    pub base_ref: String,
+    pub changed_files: Vec<PathBuf>,
+    pub affected_routes: Vec<RouteReference>,
+    pub newly_introduced_drifts: Vec<Finding>,
+    pub regressions: Vec<RouteRegression>,
+    pub baseline_regression_checks: Vec<BaselineRegressionCheck>,
+    pub baseline_comparison_routes: usize,
+    pub unchanged_drifts: Vec<Finding>,
+    pub resolved_drifts: Vec<Finding>,
+    pub unverified_drifts: Vec<Finding>,
+    pub base_summary: Option<AnalysisSummary>,
+    pub current_summary: Option<AnalysisSummary>,
+    pub analysis_warnings: Vec<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteRegression {
+    pub route: RouteReference,
+    pub reason: String,
+}
+
+/// A baseline-relative observation, not a standalone peer finding or vulnerability.
+#[derive(Debug, Clone, Serialize)]
+pub struct BaselineRegressionCheck {
+    pub route: RouteReference,
+    pub dimension: String,
+    pub change: String,
+    pub status: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HandlerResolutionEvidence {
+    pub route: RouteReference,
+    pub definition_file: Option<PathBuf>,
+    pub definition_line: Option<usize>,
+    pub definition_path: Option<String>,
+    pub confidence: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
+    #[serde(skip_serializing)]
+    pub local_rejections: Vec<security::LocalRejection>,
+    pub candidate_relationships: Vec<policy_drift::Relationship>,
+    pub review_observations: Vec<policy_drift::ReviewObservation>,
+    pub check_comparisons: Vec<security::CheckContrast>,
+    pub analysis_evidence: Vec<policy_drift::StageEvidence>,
+    pub resource_evidence: Vec<policy_drift::ResourceEvidence>,
+    pub handler_resolution_evidence: Vec<HandlerResolutionEvidence>,
+    pub security_assessments: Vec<security::Assessment>,
+    pub diagnostics: Vec<registration::Diagnostic>,
     pub files_scanned: usize,
     pub parse_errors: Vec<String>,
     pub routes: Vec<Route>,
@@ -187,12 +459,20 @@ pub struct Report {
     pub invariants: Vec<AuthorizationInvariant>,
     pub findings: Vec<String>,
     pub finding_details: Vec<Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<AuthorizationRelationshipGraph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<AnalysisSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_report: Option<DiffAnalysisReport>,
 }
 
 /// One lexical scope: a block, or the binding region of a function, closure,
 /// loop, match arm, or `if let`/`while let`.
 #[derive(Default)]
 struct BlockScope {
+    app_builders: HashMap<String, Expr>,
+    nonsecurity_middleware: HashSet<String>,
     /// Value bindings in scope at the current point of the walk. A `let`
     /// binding is added only after its statement, so earlier statements and its
     /// own initializer are not shadowed.
@@ -207,6 +487,8 @@ struct BlockScope {
 impl BlockScope {
     fn with_locals(locals: HashSet<String>) -> Self {
         Self {
+            app_builders: HashMap::new(),
+            nonsecurity_middleware: HashSet::new(),
             locals,
             items: HashMap::new(),
         }
@@ -214,6 +496,11 @@ impl BlockScope {
 }
 
 struct RouteVisitor<'a> {
+    application: Option<String>,
+    conservative_security: bool,
+    diagnostics: Vec<registration::Diagnostic>,
+    mounted_routes: Vec<Route>,
+    expansion_depth: usize,
     file: PathBuf,
     index: &'a HandlerIndex,
     crate_key: PathBuf,
@@ -234,6 +521,11 @@ impl<'a> RouteVisitor<'a> {
             .cloned()
             .unwrap_or_else(|| (file.clone(), Vec::new()));
         Self {
+            application: None,
+            conservative_security: false,
+            diagnostics: Vec::new(),
+            mounted_routes: Vec::new(),
+            expansion_depth: 0,
             file,
             index,
             crate_key,
@@ -298,15 +590,28 @@ impl<'a> RouteVisitor<'a> {
         }
 
         let Some(path) = first_string_arg(&node.args) else {
+            self.diagnostic(
+                "unsupported_registration",
+                node.span().start().line,
+                "Route path is not a supported string literal",
+            );
             return;
         };
 
         let local_prefix = scope_prefix(&node.receiver);
         let prefix = join_paths(&self.scope_context, &local_prefix);
         let path = join_paths(&prefix, &path);
-        let target = find_handler(&node.args);
+        let context = (self.crate_key.clone(), self.module.clone());
+        let target = find_handler(&node.args, self.index, &context);
         let (handler_evidence, handler_resolution) = match &target {
-            None => (Vec::new(), None),
+            None => {
+                self.diagnostic(
+                    "unsupported_registration",
+                    node.span().start().line,
+                    "Route has no supported handler target; security enforcement is unknown",
+                );
+                (Vec::new(), None)
+            }
             Some(target) => match self.block_local_handler(target) {
                 Some(Some(evidence)) => (evidence.to_vec(), Some(HandlerResolution::Local)),
                 Some(None) => (Vec::new(), Some(HandlerResolution::Unresolved)),
@@ -324,6 +629,33 @@ impl<'a> RouteVisitor<'a> {
         let handler = target.as_ref().and_then(HandlerTarget::name);
         let mut authorization =
             classify_authorization(node, handler.as_deref(), &handler_evidence, &self.file);
+        if target.is_none() {
+            // Preserve the existing null handler-resolution JSON representation.
+            // Missing registration evidence is uncertainty, never a public policy.
+            authorization.push(AuthEvidence {
+                kind: AuthEvidenceKind::Unknown,
+                mechanism: "UnsupportedRegistration".into(),
+                symbol: None,
+                file: self.file.clone(),
+                line: node.span().start().line,
+                handler: None,
+                strength: AuthStrength::Weak,
+            });
+        }
+        if self.conservative_security {
+            // A route builder argument is visited after add_route, so capture
+            // its opaque middleware here without borrowing sibling arguments.
+            for arg in node.args.iter().skip(1) {
+                if let Expr::MethodCall(builder) = arg {
+                    for mut evidence in security::unknown_middleware(builder, &self.file) {
+                        evidence.handler = handler.clone();
+                        if !authorization.contains(&evidence) {
+                            authorization.push(evidence);
+                        }
+                    }
+                }
+            }
+        }
         // Middleware and guards of this route's scope, wherever they appear in
         // its builder chain, and of every enclosing scope. Evidence already
         // found on the route's own receiver chain is not repeated.
@@ -338,7 +670,16 @@ impl<'a> RouteVisitor<'a> {
         let line = first_string_arg_line(&node.args).unwrap_or_else(|| node.span().start().line);
 
         self.routes.push(Route {
-            method: extract_http_method(node),
+            application: self.application.clone(),
+            method: node
+                .args
+                .last()
+                .and_then(|builder| {
+                    registration::resolved_route_builder(self.index, &context, builder)
+                })
+                .as_ref()
+                .and_then(route_builder_method)
+                .unwrap_or_else(|| extract_http_method(node)),
             path,
             scope_prefix: prefix,
             handler,
@@ -354,9 +695,19 @@ impl<'a> RouteVisitor<'a> {
 impl<'ast> Visit<'ast> for RouteVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.add_attribute_routes(node);
+        let previous_application = self.application.clone();
+        if self.application.is_none() {
+            self.application = Some(format!(
+                "declaration:{}:{}:{}",
+                self.file.display(),
+                self.module.join("::"),
+                node.sig.ident
+            ));
+        }
         self.with_locals(signature_bindings(&node.sig), |visitor| {
             visit::visit_item_fn(visitor, node)
         });
+        self.application = previous_application;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
@@ -448,27 +799,129 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
                     .last_mut()
                     .expect("block scope pushed above");
                 pattern_bindings(&local.pat, &mut scope.locals);
+                if let Pat::Ident(binding) = &local.pat {
+                    scope.app_builders.remove(&binding.ident.to_string());
+                    if binding.mutability.is_none() {
+                        if let Some(init) = &local.init {
+                            if registration::is_app_builder(&init.expr) {
+                                scope
+                                    .app_builders
+                                    .insert(binding.ident.to_string(), (*init.expr).clone());
+                            }
+                        }
+                    }
+                    scope
+                        .nonsecurity_middleware
+                        .remove(&binding.ident.to_string());
+                    if binding.mutability.is_none()
+                        && local
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| security::known_nonsecurity_constructor(&init.expr))
+                    {
+                        scope
+                            .nonsecurity_middleware
+                            .insert(binding.ident.to_string());
+                    }
+                }
             }
         }
         self.block_scopes.pop();
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        // Expand only immutable, lexically scoped App values. Mutable/conditional
+        // builders and arbitrary value aliases remain unsupported.
+        let mut binding_root = &*node.receiver;
+        while let Expr::MethodCall(call) = binding_root {
+            binding_root = &call.receiver;
+        }
+        if let Expr::Path(path) = binding_root {
+            if let Some(name) = path.path.get_ident() {
+                let value = self
+                    .block_scopes
+                    .iter()
+                    .rev()
+                    .find(|s| s.locals.contains(&name.to_string()))
+                    .and_then(|s| s.app_builders.get(&name.to_string()))
+                    .cloned();
+                if let Some(value) = value {
+                    let mut expanded = node.clone();
+                    fn replace_root(receiver: &mut Expr, value: Expr) {
+                        match receiver {
+                            Expr::MethodCall(call) => replace_root(&mut call.receiver, value),
+                            _ => *receiver = value,
+                        }
+                    }
+                    replace_root(&mut expanded.receiver, value);
+                    self.visit_expr_method_call(&expanded);
+                    return;
+                }
+            }
+        }
+        let previous_application = self.application.clone();
+        let mut app_root = &*node.receiver;
+        while let Expr::MethodCall(call) = app_root {
+            app_root = &call.receiver;
+        }
+        if let Expr::Call(call) = app_root {
+            if matches!(&*call.func, Expr::Path(p) if p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().ends_with(&["App".into(), "new".into()]))
+            {
+                self.application = Some(format!(
+                    "{}:{}:{}",
+                    self.file.display(),
+                    call.span().start().line,
+                    call.span().start().column
+                ));
+            }
+        }
+        if node.method == "wrap"
+            && node
+                .args
+                .iter()
+                .any(|arg| route_configuration_name_in_expr(arg).is_none())
+        {
+            self.diagnostic("unresolved_middleware", node.span().start().line, "Middleware has no security model; absence of recognized evidence does not prove it is non-security middleware");
+        }
+        if self.visit_resource_registration(node) {
+            self.application = previous_application;
+            return;
+        }
         // The outermost call of a builder chain is visited first; collect the
         // chain's guards and middleware there so that every route in the chain,
         // and in scopes nested under it, receives them.
         let root = chain_root(node);
         let starts_chain = self.chain_scopes.last().map(|(chain, _)| *chain) != Some(root);
         if starts_chain {
-            let evidence = chain_configuration_evidence(node, &self.file);
+            let mut evidence = chain_configuration_evidence(node, &self.file);
+            if self.conservative_security {
+                evidence.extend(
+                    security::unknown_middleware(node, &self.file)
+                        .into_iter()
+                        .filter(|e| {
+                            !e.symbol.as_ref().is_some_and(|name| {
+                                self.block_scopes
+                                    .iter()
+                                    .rev()
+                                    .find(|s| s.locals.contains(name))
+                                    .is_some_and(|s| s.nonsecurity_middleware.contains(name))
+                            })
+                        }),
+                );
+            }
             self.chain_scopes.push((root, evidence));
         }
 
-        if node.method == "service" {
+        if node.method == "configure" {
+            self.expand_configuration(node);
+            self.visit_expr(&node.receiver);
+        } else if node.method == "service" {
             let previous_context = self.scope_context.clone();
             self.scope_context = join_paths(&previous_context, &scope_prefix(&node.receiver));
             for arg in &node.args {
-                self.visit_expr(arg);
+                if !self.expand_service(arg) {
+                    self.visit_expr(arg);
+                }
             }
             self.scope_context = previous_context;
             self.visit_expr(&node.receiver);
@@ -480,53 +933,177 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         if starts_chain {
             self.chain_scopes.pop();
         }
+        self.application = previous_application;
     }
+}
+
+pub(super) struct AttributeRouteInfo {
+    pub(super) path: String,
+    pub(super) methods: Vec<String>,
+    pub(super) line: usize,
+    modifiers: Vec<String>,
+}
+
+fn attribute_route_name(attribute: &syn::Attribute) -> Option<String> {
+    let path = attribute.path();
+    if !(path.segments.len() == 1
+        || (path.segments.len() == 2 && path.segments[0].ident == "actix_web"))
+    {
+        return None;
+    }
+    let name = path.segments.last()?.ident.to_string();
+    matches!(
+        name.as_str(),
+        "get"
+            | "post"
+            | "put"
+            | "patch"
+            | "delete"
+            | "head"
+            | "options"
+            | "trace"
+            | "connect"
+            | "route"
+    )
+    .then_some(name)
+}
+
+pub(super) fn parse_attribute_route(attribute: &syn::Attribute) -> Option<AttributeRouteInfo> {
+    let name = attribute_route_name(attribute)?;
+    let args = attribute
+        .parse_args_with(syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated)
+        .ok()?;
+    let Expr::Lit(ExprLit {
+        lit: Lit::Str(path),
+        ..
+    }) = args.first()?
+    else {
+        return None;
+    };
+    let mut methods = if name == "route" {
+        Vec::new()
+    } else {
+        vec![name.to_uppercase()]
+    };
+    let mut modifiers = Vec::new();
+    for arg in args.iter().skip(1) {
+        let Expr::Assign(assign) = arg else {
+            return None;
+        };
+        let Expr::Path(key) = &*assign.left else {
+            return None;
+        };
+        let Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) = &*assign.right
+        else {
+            return None;
+        };
+        if key.path.is_ident("method") && name == "route" {
+            let method = value.value();
+            if !matches!(
+                method.as_str(),
+                "GET"
+                    | "POST"
+                    | "PUT"
+                    | "PATCH"
+                    | "DELETE"
+                    | "HEAD"
+                    | "OPTIONS"
+                    | "TRACE"
+                    | "CONNECT"
+            ) {
+                return None;
+            }
+            if !methods.contains(&method) {
+                methods.push(method);
+            }
+        } else if key.path.is_ident("wrap") || key.path.is_ident("guard") {
+            modifiers.push(format!("{} = {}", key.to_token_stream(), value.value()));
+        } else {
+            return None;
+        }
+    }
+    // A generic route attribute must supply methods; never invent GET.
+    if methods.is_empty() {
+        return None;
+    }
+    Some(AttributeRouteInfo {
+        path: path.value(),
+        methods,
+        line: path.span().start().line,
+        modifiers,
+    })
 }
 
 impl RouteVisitor<'_> {
     fn add_attribute_routes(&mut self, node: &ItemFn) {
         for attribute in &node.attrs {
-            let Some(method) = attribute_route_method(attribute) else {
-                continue;
-            };
-            let Ok(path_literal) = attribute.parse_args::<syn::LitStr>() else {
+            // An explicit conflicting/foreign import overrides a bare macro name.
+            // Do not treat another framework's `get` as Actix registration.
+            if attribute.path().segments.len() == 1 {
+                let name = attribute.path().segments[0].ident.to_string();
+                if let Some(imports) = self
+                    .index
+                    .scopes
+                    .get(&(self.crate_key.clone(), self.module.clone()))
+                    .and_then(|scope| scope.imports.get(&name))
+                {
+                    if imports.len() != 1
+                        || imports[0].segments != ["actix_web".to_string(), name.clone()]
+                    {
+                        if attribute_route_name(attribute).is_some() {
+                            self.diagnostic(
+                                "unsupported_attribute",
+                                attribute.span().start().line,
+                                "Route attribute import is foreign, renamed or ambiguous",
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+            let Some(info) = parse_attribute_route(attribute) else {
+                if attribute_route_name(attribute).is_some() {
+                    self.diagnostic("unsupported_attribute", attribute.span().start().line,
+                        "Route attribute requires a literal path, explicit valid methods and supported literal arguments");
+                }
                 continue;
             };
 
             let prefix = self.scope_context.clone();
-            let path = join_paths(&prefix, &path_literal.value());
+            let path = join_paths(&prefix, &info.path);
             let handler = node.sig.ident.to_string();
-            let authorization = handler_evidence(&self.file, node);
+            let mut authorization = handler_evidence(&self.file, node);
+            for modifier in info.modifiers {
+                authorization.push(AuthEvidence {
+                    kind: AuthEvidenceKind::Unknown,
+                    mechanism: "UnresolvedAttributeConfiguration".into(),
+                    symbol: Some(modifier),
+                    file: self.file.clone(),
+                    line: info.line,
+                    handler: Some(handler.clone()),
+                    strength: AuthStrength::Weak,
+                });
+            }
 
-            self.routes.push(Route {
-                method: method.into(),
-                path,
-                scope_prefix: prefix,
-                authorization,
-                handler_path: Some(handler.clone()),
-                handler_resolution: Some(HandlerResolution::Definition),
-                handler: Some(handler),
-                line: path_literal.span().start().line,
-                file: self.file.clone(),
-            });
+            for method in info.methods {
+                self.routes.push(Route {
+                    application: self.application.clone(),
+                    method,
+                    path: path.clone(),
+                    scope_prefix: prefix.clone(),
+                    authorization: authorization.clone(),
+                    handler_path: Some(handler.clone()),
+                    handler_resolution: Some(HandlerResolution::Definition),
+                    handler: Some(handler.clone()),
+                    line: info.line,
+                    file: self.file.clone(),
+                });
+            }
         }
     }
-}
-
-fn attribute_route_method(attribute: &syn::Attribute) -> Option<&'static str> {
-    for (name, method) in [
-        ("get", "GET"),
-        ("post", "POST"),
-        ("put", "PUT"),
-        ("patch", "PATCH"),
-        ("delete", "DELETE"),
-        ("head", "HEAD"),
-    ] {
-        if attribute.path().is_ident(name) {
-            return Some(method);
-        }
-    }
-    None
 }
 
 fn first_string_arg(args: &syn::punctuated::Punctuated<Expr, syn::token::Comma>) -> Option<String> {
@@ -738,7 +1315,7 @@ fn configuration_call_evidence(
         evidence.push(AuthEvidence {
             kind,
             mechanism: identifier.name.clone(),
-            symbol: Some(identifier.name),
+            symbol: Some(if matches!(arg, Expr::Call(_)) { arg.to_token_stream().to_string() } else { identifier.name }),
             file: file.to_path_buf(),
             line: identifier.line,
             handler: handler.map(str::to_owned),
@@ -865,18 +1442,38 @@ type ModuleKey = (PathBuf, Vec<String>);
 
 const MAX_RESOLUTION_DEPTH: usize = 16;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct HandlerDefinition {
+    file: PathBuf,
+    function: ItemFn,
     crate_key: PathBuf,
     module: Vec<String>,
     name: String,
     evidence: Vec<AuthEvidence>,
+    owner: Option<ModuleKey>,
+    implemented_trait: Option<ModuleKey>,
+}
+
+impl std::fmt::Debug for HandlerDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandlerDefinition")
+            .field("name", &self.name)
+            .field("file", &self.file)
+            .finish()
+    }
 }
 
 impl HandlerDefinition {
     fn rust_path(&self) -> String {
         std::iter::once("crate")
-            .chain(self.module.iter().map(String::as_str))
+            .chain(
+                self.owner
+                    .as_ref()
+                    .map(|k| &k.1)
+                    .unwrap_or(&self.module)
+                    .iter()
+                    .map(String::as_str),
+            )
             .chain(std::iter::once(self.name.as_str()))
             .collect::<Vec<_>>()
             .join("::")
@@ -893,6 +1490,8 @@ struct UsePath {
 struct ModuleScope {
     imports: HashMap<String, Vec<UsePath>>,
     globs: Vec<UsePath>,
+    public_imports: HashSet<String>,
+    public_globs: Vec<UsePath>,
 }
 
 enum Lookup {
@@ -908,16 +1507,317 @@ enum Lookup {
 
 /// Every free function in the scanned repository, keyed by crate and module
 /// path, together with each module's `use` declarations.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct HandlerIndex {
     definitions: Vec<HandlerDefinition>,
     by_name: HashMap<String, Vec<usize>>,
     scopes: HashMap<ModuleKey, ModuleScope>,
     modules: HashSet<ModuleKey>,
     file_modules: HashMap<PathBuf, ModuleKey>,
+    dependencies: HashMap<(PathBuf, String), PathBuf>,
+    public_modules: HashSet<ModuleKey>,
+    record_types: HashSet<ModuleKey>,
+    pending_impls: Vec<(PathBuf, ModuleKey, syn::ItemImpl)>,
+    traits: HashMap<ModuleKey, (PathBuf, syn::ItemTrait)>,
+    type_aliases: HashMap<ModuleKey, syn::ItemType>,
+    conditional_result_kinds: HashSet<ModuleKey>,
+    methods: Vec<usize>,
+    record_attributes: HashMap<ModuleKey, Vec<syn::Attribute>>,
+    record_fields: HashMap<ModuleKey, HashMap<String, (syn::Type, bool)>>,
+    schema_macros: Vec<(ModuleKey, syn::ItemMacro)>,
+    macro_uses: Vec<(ModuleKey, String)>,
+    diesel_tables: HashSet<ModuleKey>,
 }
 
 impl HandlerIndex {
+    fn attach_conditional_result_aliases(&mut self) {
+        // Model only standard cfg_select's configuration-invariant Result aliases.
+        // No feature is selected and no arbitrary macro body is expanded.
+        struct Branches(Vec<Vec<Item>>);
+        impl syn::parse::Parse for Branches {
+            fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+                let mut branches = Vec::new();
+                while !input.is_empty() {
+                    while !input.peek(syn::Token![=>]) {
+                        let _: proc_macro2::TokenTree = input.parse()?;
+                    }
+                    let _: syn::Token![=>] = input.parse()?;
+                    let body;
+                    syn::braced!(body in input);
+                    let mut items = Vec::new();
+                    while !body.is_empty() {
+                        items.push(body.parse()?);
+                    }
+                    branches.push(items);
+                    if input.peek(syn::Token![,]) {
+                        let _: syn::Token![,] = input.parse()?;
+                    }
+                }
+                Ok(Self(branches))
+            }
+        }
+        fn shadows(tree: &UseTree, name: &str) -> bool {
+            match tree {
+                UseTree::Path(p) => shadows(&p.tree, name),
+                UseTree::Name(n) => n.ident == name,
+                UseTree::Rename(r) => r.rename == name,
+                UseTree::Group(g) => g.items.iter().any(|u| shadows(u, name)),
+                UseTree::Glob(_) => true,
+            }
+        }
+        let mut additions = Vec::new();
+        for (context, item) in &self.schema_macros {
+            if !matches!(
+                security::external_path(self, context, &item.mac.path, 0).as_deref(),
+                Some("cfg_select" | "std::cfg_select")
+            ) {
+                continue;
+            }
+            if self.macro_uses.iter().any(|(c, _)| c.0 == context.0)
+                || self.schema_macros.iter().any(|(c, m)| {
+                    c.0 == context.0
+                        && m.mac.path.is_ident("macro_rules")
+                        && m.ident.as_ref().is_some_and(|n| n == "cfg_select")
+                })
+            {
+                continue;
+            }
+            let Ok(Branches(branches)) = syn::parse2(item.mac.tokens.clone()) else {
+                continue;
+            };
+            let mut aliases: HashMap<String, Vec<&syn::ItemType>> = HashMap::new();
+            for branch in &branches {
+                for item in branch {
+                    if let Item::Type(alias) = item {
+                        aliases
+                            .entry(alias.ident.to_string())
+                            .or_default()
+                            .push(alias);
+                    }
+                }
+            }
+            for (name, definitions) in aliases {
+                let first = definitions[0];
+                if !definitions.iter().all(|d| {
+                    d.ty.to_token_stream().to_string() == first.ty.to_token_stream().to_string()
+                        && d.generics.to_token_stream().to_string()
+                            == first.generics.to_token_stream().to_string()
+                }) {
+                    continue;
+                }
+                if branches.iter().any(|b| {
+                    b.iter()
+                        .filter(|i| matches!(i,Item::Type(t) if t.ident==name))
+                        .count()
+                        > 1
+                }) {
+                    continue;
+                }
+                let syn::Type::Path(p) = &*first.ty else {
+                    continue;
+                };
+                let Some(root) = p.path.segments.first() else {
+                    continue;
+                };
+                if first.generics.type_params().any(|p| p.ident == root.ident) {
+                    continue;
+                }
+                if !matches!(
+                    security::external_path(self, context, &p.path, 0).as_deref(),
+                    Some("Result" | "std::result::Result" | "core::result::Result")
+                ) {
+                    continue;
+                }
+                if branches.iter().flatten().any(|i| match i {
+                    Item::Use(u) => shadows(&u.tree, &root.ident.to_string()),
+                    Item::Type(t) => t.ident == root.ident,
+                    Item::Struct(t) => t.ident == root.ident,
+                    Item::Enum(t) => t.ident == root.ident,
+                    Item::Mod(t) => t.ident == root.ident,
+                    Item::Trait(t) => t.ident == root.ident,
+                    Item::Union(t) => t.ident == root.ident,
+                    Item::ExternCrate(t) => {
+                        t.rename.as_ref().map(|(_, n)| n).unwrap_or(&t.ident) == &root.ident
+                    }
+                    Item::Macro(_) => true,
+                    _ => false,
+                }) {
+                    continue;
+                }
+                let mut path = context.1.clone();
+                path.push(name);
+                let key = (context.0.clone(), path);
+                if !self.modules.contains(&key) {
+                    additions.push((key, first.clone()));
+                }
+            }
+        }
+        let mut counts = HashMap::new();
+        for (k, _) in &additions {
+            *counts.entry(k.clone()).or_insert(0usize) += 1;
+        }
+        for (key, alias) in additions {
+            if counts[&key] != 1 {
+                continue;
+            }
+            self.modules.insert(key.clone());
+            if matches!(alias.vis, syn::Visibility::Public(_)) {
+                self.public_modules.insert(key.clone());
+            }
+            // This proves Result's control-flow kind, not a complete expanded
+            // payload/record definition. Do not turn it into resource identity.
+            self.conditional_result_kinds.insert(key);
+        }
+    }
+
+    fn attach_diesel_tables(&mut self) {
+        // Parse only the public table!/dsl declaration contract. This is not a
+        // macro expander and does not manufacture model-to-table associations.
+        struct Declaration {
+            name: String,
+        }
+        impl syn::parse::Parse for Declaration {
+            fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+                while input.peek(syn::Token![use]) {
+                    let _: syn::ItemUse = input.parse()?;
+                }
+                let _ = input.call(syn::Attribute::parse_outer)?;
+                let visibility: syn::Visibility = input.parse()?;
+                if matches!(visibility, syn::Visibility::Restricted(_)) {
+                    return Err(input.error("restricted schema visibility is not modeled"));
+                }
+                let mut name: syn::Ident = input.parse()?;
+                if input.peek(syn::Token![.]) {
+                    let _: syn::Token![.] = input.parse()?;
+                    name = input.parse()?;
+                }
+                let keys = if input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    content
+                        .parse_terminated(|p| p.parse::<syn::Ident>(), syn::Token![,])?
+                        .into_iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec!["id".into()]
+                };
+                let content;
+                syn::braced!(content in input);
+                let mut columns = HashSet::new();
+                while !content.is_empty() {
+                    let _ = content.call(syn::Attribute::parse_outer)?;
+                    let column: syn::Ident = content.parse()?;
+                    let _: syn::Token![->] = content.parse()?;
+                    let _: syn::Type = content.parse()?;
+                    if !columns.insert(column.to_string()) {
+                        return Err(content.error("duplicate column"));
+                    }
+                    if !content.is_empty() {
+                        let _: syn::Token![,] = content.parse()?;
+                    }
+                }
+                if keys.is_empty() || !keys.iter().all(|k| columns.contains(k)) {
+                    return Err(input.error("unresolved primary key"));
+                }
+                Ok(Self {
+                    name: name.to_string(),
+                })
+            }
+        }
+        let mut declarations: HashMap<ModuleKey, usize> = HashMap::new();
+        for (context, item) in &self.schema_macros {
+            let qualified = security::external_path(self, context, &item.mac.path, 0).as_deref()
+                == Some("diesel::table");
+            let visible: Vec<_> = self
+                .macro_uses
+                .iter()
+                .filter(|(key, _)| key.0 == context.0 && context.1.starts_with(&key.1))
+                .collect();
+            let bare = item.mac.path.is_ident("table")
+                && visible.len() == 1
+                && visible[0].1 == "diesel"
+                && !self
+                    .dependencies
+                    .contains_key(&(context.0.clone(), "diesel".into()))
+                && !self.schema_macros.iter().any(|(key, m)| {
+                    key.0 == context.0
+                        && m.mac.path.is_ident("macro_rules")
+                        && m.ident.as_ref().is_some_and(|n| n == "table")
+                })
+                && self
+                    .scope(&context.0, &context.1)
+                    .is_none_or(|s| s.globs.is_empty() && !s.imports.contains_key("table"));
+            if !qualified && !bare {
+                continue;
+            }
+            let Ok(declaration) = syn::parse2::<Declaration>(item.mac.tokens.clone()) else {
+                continue;
+            };
+            let mut path = context.1.clone();
+            path.push(declaration.name);
+            *declarations.entry((context.0.clone(), path)).or_default() += 1;
+        }
+        for (table, count) in declarations {
+            if count != 1 || self.modules.contains(&table) {
+                continue;
+            }
+            let mut dsl = table.1.clone();
+            dsl.push("dsl".into());
+            let dsl = (table.0.clone(), dsl);
+            self.modules.insert(table.clone());
+            self.modules.insert(dsl.clone());
+            self.public_modules.insert(table.clone());
+            self.public_modules.insert(dsl.clone());
+            let path = UsePath {
+                segments: std::iter::once("crate".into())
+                    .chain(table.1.iter().cloned())
+                    .collect(),
+                leading_colon: false,
+            };
+            for (key, name) in [
+                (table.clone(), "table".to_owned()),
+                (dsl, table.1.last().unwrap().clone()),
+            ] {
+                let scope = self.scopes.entry(key).or_default();
+                scope.public_imports.insert(name.clone());
+                scope.imports.entry(name).or_default().push(path.clone());
+            }
+            self.diesel_tables.insert(table);
+        }
+    }
+
+    fn route_handler(&self, route: &Route) -> Option<&HandlerDefinition> {
+        if matches!(
+            route.handler_resolution,
+            Some(HandlerResolution::Unresolved | HandlerResolution::Ambiguous { .. })
+        ) {
+            return None;
+        }
+        let (crate_key, module) = self.file_modules.get(&route.file)?;
+        let path = route.handler_path.as_ref()?;
+        self.resolve_handler(
+            crate_key,
+            module,
+            &HandlerTarget::Path {
+                segments: path
+                    .trim_start_matches("::")
+                    .split("::")
+                    .map(str::to_owned)
+                    .collect(),
+                leading_colon: path.starts_with("::"),
+            },
+        )
+        .0
+        .or_else(|| {
+            let mut matches = self
+                .definitions
+                .iter()
+                .filter(|d| d.file == route.file && Some(&d.name) == route.handler.as_ref());
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+    }
     fn build<'a>(files: impl IntoIterator<Item = (&'a Path, ModuleKey, &'a syn::File)>) -> Self {
         let mut index = Self::default();
         for (file, (crate_key, mut module), syntax) in files {
@@ -931,7 +1831,311 @@ impl HandlerIndex {
                 .insert(file.to_path_buf(), (crate_key.clone(), module.clone()));
             index.add_items(file, &crate_key, &mut module, &syntax.items);
         }
+        index.attach_impls();
         index
+    }
+
+    fn load_workspace(&mut self, root: &Path) -> Option<String> {
+        let start = if root.is_file() { root.parent()? } else { root };
+        let manifest = start
+            .ancestors()
+            .map(|p| p.join("Cargo.toml"))
+            .find(|p| p.is_file())?;
+        let output = std::process::Command::new("cargo")
+            .args([
+                "metadata",
+                "--frozen",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .output();
+        let metadata = output
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok());
+        let Some(metadata) = metadata else {
+            return Some(
+                "Offline Cargo metadata unavailable; cross-crate resolution abstains".into(),
+            );
+        };
+        let keys: HashMap<_, _> = self
+            .modules
+            .iter()
+            .filter_map(|(key, _)| {
+                key.canonicalize()
+                    .ok()
+                    .map(|canonical| (canonical, key.clone()))
+            })
+            .collect();
+        let packages = metadata["packages"].as_array()?;
+        for package in packages {
+            let Some(directory) = package["manifest_path"]
+                .as_str()
+                .and_then(|p| Path::new(p).parent())
+                .and_then(|p| p.canonicalize().ok())
+            else {
+                continue;
+            };
+            let Some(source) = keys.get(&directory) else {
+                continue;
+            };
+            if let Some(deps) = package["dependencies"].as_array() {
+                for dep in deps {
+                    if dep["kind"].as_str() == Some("dev") {
+                        continue;
+                    }
+                    let Some(target) = dep["path"]
+                        .as_str()
+                        .and_then(|p| Path::new(p).canonicalize().ok())
+                        .and_then(|p| keys.get(&p))
+                    else {
+                        continue;
+                    };
+                    let Some(name) = dep["rename"].as_str().or_else(|| dep["name"].as_str()) else {
+                        continue;
+                    };
+                    self.dependencies
+                        .insert((source.clone(), name.replace('-', "_")), target.clone());
+                }
+            }
+        }
+        self.attach_impls();
+        None
+    }
+
+    fn exported_lookup(&self, target: &ModuleKey, name: &str, lookup: Lookup) -> Lookup {
+        // Cross-crate access must be through public modules and exported items.
+        let scope = self.scope(&target.0, &target.1);
+        let public_item = if scope.is_some_and(|s| s.imports.contains_key(name)) {
+            scope.is_some_and(|s| s.public_imports.contains(name))
+        } else {
+            matches!(&lookup, Lookup::Found(i, _) if {
+                let d = &self.definitions[*i];
+                matches!(d.function.vis, syn::Visibility::Public(_)) &&
+                ((d.crate_key == target.0 && d.owner.as_ref().map(|k| k.1.as_slice()).unwrap_or(&d.module) == target.1) || scope.is_some_and(|s|
+                    s.public_globs.iter().any(|glob| self.resolve_module(&target.0, &target.1, glob, 0)
+                        .is_some_and(|m| m.0 == d.crate_key && m.1 == d.module))))
+            })
+        };
+        if public_item {
+            lookup
+        } else {
+            Lookup::NotFound { explicit: true }
+        }
+    }
+
+    fn attach_impls(&mut self) {
+        for (file, lexical, item) in self.pending_impls.clone() {
+            // Generic specialization, blanket impls and trait-object dispatch
+            // require type inference we do not have. Lifetimes alone are safe.
+            if item.generics.type_params().next().is_some()
+                || item.generics.const_params().next().is_some()
+            {
+                continue;
+            }
+            let syn::Type::Path(ty) = &*item.self_ty else {
+                continue;
+            };
+            if ty.path.segments.iter().any(|s| matches!(&s.arguments, syn::PathArguments::AngleBracketed(a) if a.args.iter().any(|g| !matches!(g, syn::GenericArgument::Lifetime(_))))) { continue; }
+            let path = UsePath {
+                segments: ty
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect(),
+                leading_colon: ty.path.leading_colon.is_some(),
+            };
+            let Some(owner) = self
+                .resolve_module(&lexical.0, &lexical.1, &path, 0)
+                .filter(|k| self.record_types.contains(k))
+            else {
+                continue;
+            };
+            let implemented_trait = if let Some((path, _)) = &item.trait_ {
+                let path = UsePath {
+                    segments: path.segments.iter().map(|s| s.ident.to_string()).collect(),
+                    leading_colon: path.leading_colon.is_some(),
+                };
+                let Some(key) = self
+                    .resolve_module(&lexical.0, &lexical.1, &path, 0)
+                    .filter(|k| self.traits.contains_key(k))
+                else {
+                    continue;
+                };
+                Some(key)
+            } else {
+                None
+            };
+            let mut methods: Vec<(ItemFn, ModuleKey, PathBuf)> = item
+                .items
+                .iter()
+                .filter_map(|member| {
+                    let syn::ImplItem::Fn(method) = member else {
+                        return None;
+                    };
+                    let function = syn::parse2::<ItemFn>(method.to_token_stream()).ok()?;
+                    Some((function, lexical.clone(), file.clone()))
+                })
+                .collect();
+            if let Some(key) = &implemented_trait {
+                if let Some((trait_file, definition)) = self.traits.get(key) {
+                    for member in &definition.items {
+                        let syn::TraitItem::Fn(method) = member else {
+                            continue;
+                        };
+                        let Some(body) = &method.default else {
+                            continue;
+                        };
+                        if item.items.iter().any(|m| matches!(m, syn::ImplItem::Fn(m) if m.sig.ident == method.sig.ident)) { continue; }
+                        let sig = &method.sig;
+                        if let Ok(function) = syn::parse2::<ItemFn>(quote::quote!(#sig #body)) {
+                            methods.push((
+                                function,
+                                (key.0.clone(), key.1[..key.1.len() - 1].to_vec()),
+                                trait_file.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            for (function, context, source) in methods {
+                let name = function.sig.ident.to_string();
+                if self.methods.iter().any(|&i| {
+                    let d = &self.definitions[i];
+                    d.owner.as_ref() == Some(&owner)
+                        && d.implemented_trait == implemented_trait
+                        && d.file == source
+                        && d.function.sig.ident.span().start() == function.sig.ident.span().start()
+                        && d.name == name
+                }) {
+                    continue;
+                }
+                let i = self.definitions.len();
+                // Only inherent static methods participate in ordinary path lookup.
+                // Resource tracing separately checks scoped trait applicability.
+                if implemented_trait.is_none()
+                    && function.sig.receiver().is_none()
+                    && matches!(function.vis, syn::Visibility::Public(_))
+                {
+                    self.by_name.entry(name.clone()).or_default().push(i);
+                }
+                self.methods.push(i);
+                self.definitions.push(HandlerDefinition {
+                    file: source.clone(),
+                    evidence: handler_evidence(&source, &function),
+                    function,
+                    crate_key: context.0,
+                    module: context.1,
+                    name,
+                    owner: Some(owner.clone()),
+                    implemented_trait: implemented_trait.clone(),
+                });
+            }
+        }
+    }
+
+    fn resource_method(
+        &self,
+        caller: &HandlerDefinition,
+        owner: &ModuleKey,
+        name: &str,
+        receiver_call: bool,
+    ) -> Option<&HandlerDefinition> {
+        let candidates: Vec<_> = self
+            .methods
+            .iter()
+            .map(|&i| &self.definitions[i])
+            .filter(|d| d.owner.as_ref() == Some(owner) && d.name == name)
+            .filter(|d| !receiver_call || d.function.sig.receiver().is_some())
+            .collect();
+        let inherent: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|d| d.implemented_trait.is_none())
+            .filter(|d| {
+                matches!(d.function.vis, syn::Visibility::Public(_))
+                    || (d.crate_key == caller.crate_key && caller.module.starts_with(&d.module))
+            })
+            .collect();
+        if !receiver_call && !inherent.is_empty() {
+            return (inherent.len() == 1).then(|| inherent[0]);
+        }
+        let scoped: Vec<_> = candidates
+            .into_iter()
+            .filter(|d| {
+                let Some(trait_key) = &d.implemented_trait else {
+                    return false;
+                };
+                if caller.crate_key == trait_key.0
+                    && caller.module == trait_key.1[..trait_key.1.len() - 1]
+                {
+                    return true;
+                }
+                let Some(scope) = self.scope(&caller.crate_key, &caller.module) else {
+                    return false;
+                };
+                scope
+                    .imports
+                    .values()
+                    .flatten()
+                    .chain(scope.globs.iter())
+                    .any(|path| {
+                        self.resolve_module(&caller.crate_key, &caller.module, path, 0)
+                            .as_ref()
+                            == Some(trait_key)
+                    })
+                    || (caller.crate_key == trait_key.0
+                        && caller.module == trait_key.1[..trait_key.1.len() - 1])
+            })
+            .collect();
+        if receiver_call && !inherent.is_empty() {
+            // Receiver adjustment/autoref can change Rust's preference. Without
+            // that inference, conflicting inherent/trait candidates abstain.
+            return (inherent.len() == 1 && scoped.is_empty()).then(|| inherent[0]);
+        }
+        (scoped.len() == 1).then(|| scoped[0])
+    }
+
+    fn resource_call(
+        &self,
+        caller: &HandlerDefinition,
+        segments: &[String],
+    ) -> Option<&HandlerDefinition> {
+        if segments.len() > 1 {
+            let owner = if segments[0] == "Self" {
+                caller.owner.clone()
+            } else {
+                self.resolve_module(
+                    &caller.crate_key,
+                    &caller.module,
+                    &UsePath {
+                        segments: segments[..segments.len() - 1].to_vec(),
+                        leading_colon: false,
+                    },
+                    0,
+                )
+            };
+            if let Some(owner) = owner.filter(|k| self.record_types.contains(k)) {
+                return self.resource_method(caller, &owner, segments.last()?, false);
+            }
+        }
+        let (definition, resolution) = self.resolve_handler(
+            &caller.crate_key,
+            &caller.module,
+            &HandlerTarget::Path {
+                segments: segments.to_vec(),
+                leading_colon: false,
+            },
+        );
+        if resolution == HandlerResolution::UniqueName {
+            None
+        } else {
+            definition
+        }
     }
 
     #[cfg(test)]
@@ -955,14 +2159,22 @@ impl HandlerIndex {
                         .or_default()
                         .push(self.definitions.len());
                     self.definitions.push(HandlerDefinition {
+                        file: file.to_path_buf(),
+                        function: function.clone(),
                         crate_key: crate_key.to_path_buf(),
                         module: module.clone(),
                         name,
                         evidence: handler_evidence(file, function),
+                        owner: None,
+                        implemented_trait: None,
                     });
                 }
                 Item::Mod(item_mod) => {
                     module.push(item_mod.ident.to_string());
+                    if matches!(item_mod.vis, syn::Visibility::Public(_)) {
+                        self.public_modules
+                            .insert((crate_key.to_path_buf(), module.clone()));
+                    }
                     self.modules
                         .insert((crate_key.to_path_buf(), module.clone()));
                     if let Some((_, items)) = &item_mod.content {
@@ -970,11 +2182,86 @@ impl HandlerIndex {
                     }
                     module.pop();
                 }
+                Item::Impl(item_impl) => {
+                    self.pending_impls.push((
+                        file.to_path_buf(),
+                        (crate_key.to_path_buf(), module.clone()),
+                        item_impl.clone(),
+                    ));
+                }
+                Item::Macro(item) => self
+                    .schema_macros
+                    .push(((crate_key.to_path_buf(), module.clone()), item.clone())),
+                Item::ExternCrate(item)
+                    if item.attrs.iter().any(|a| a.path().is_ident("macro_use")) =>
+                {
+                    self.macro_uses.push((
+                        (crate_key.to_path_buf(), module.clone()),
+                        item.ident.to_string(),
+                    ));
+                }
+                Item::Type(item) => {
+                    let mut path = module.clone();
+                    path.push(item.ident.to_string());
+                    let key = (crate_key.to_path_buf(), path);
+                    self.modules.insert(key.clone());
+                    if matches!(item.vis, syn::Visibility::Public(_)) {
+                        self.public_modules.insert(key.clone());
+                    }
+                    self.type_aliases.insert(key, item.clone());
+                }
+                Item::Trait(item) => {
+                    let mut path = module.clone();
+                    path.push(item.ident.to_string());
+                    let key = (crate_key.to_path_buf(), path);
+                    self.modules.insert(key.clone());
+                    if matches!(item.vis, syn::Visibility::Public(_)) {
+                        self.public_modules.insert(key.clone());
+                    }
+                    self.traits.insert(key, (file.to_path_buf(), item.clone()));
+                }
+                Item::Struct(item) => {
+                    let mut ty = module.clone();
+                    ty.push(item.ident.to_string());
+                    self.modules.insert((crate_key.to_path_buf(), ty.clone()));
+                    self.record_types
+                        .insert((crate_key.to_path_buf(), ty.clone()));
+                    self.record_attributes
+                        .insert((crate_key.to_path_buf(), ty.clone()), item.attrs.clone());
+                    self.record_fields.insert(
+                        (crate_key.to_path_buf(), ty.clone()),
+                        item.fields
+                            .iter()
+                            .filter_map(|f| {
+                                f.ident.as_ref().map(|name| {
+                                    (
+                                        name.to_string(),
+                                        (f.ty.clone(), matches!(f.vis, syn::Visibility::Public(_))),
+                                    )
+                                })
+                            })
+                            .collect(),
+                    );
+                    if matches!(item.vis, syn::Visibility::Public(_)) {
+                        self.public_modules.insert((crate_key.to_path_buf(), ty));
+                    }
+                }
                 Item::Use(item_use) => {
                     let scope = self
                         .scopes
                         .entry((crate_key.to_path_buf(), module.clone()))
                         .or_default();
+                    if matches!(item_use.vis, syn::Visibility::Public(_)) {
+                        let mut exported = ModuleScope::default();
+                        collect_use_tree(
+                            &item_use.tree,
+                            &mut Vec::new(),
+                            item_use.leading_colon.is_some(),
+                            &mut exported,
+                        );
+                        scope.public_imports.extend(exported.imports.into_keys());
+                        scope.public_globs.extend(exported.globs);
+                    }
                     collect_use_tree(
                         &item_use.tree,
                         &mut Vec::new(),
@@ -1016,6 +2303,14 @@ impl HandlerIndex {
         module: &[String],
         target: &HandlerTarget,
     ) -> (Option<&HandlerDefinition>, HandlerResolution) {
+        let module = if self
+            .record_types
+            .contains(&(crate_key.to_path_buf(), module.to_vec()))
+        {
+            &module[..module.len() - 1]
+        } else {
+            module
+        };
         let HandlerTarget::Path {
             segments,
             leading_colon,
@@ -1023,7 +2318,12 @@ impl HandlerIndex {
         else {
             return (None, HandlerResolution::Unresolved);
         };
-        if *leading_colon {
+        if *leading_colon
+            && !segments.first().is_some_and(|name| {
+                self.dependencies
+                    .contains_key(&(crate_key.to_path_buf(), name.clone()))
+            })
+        {
             return (None, HandlerResolution::Unresolved);
         }
         let Some((name, qualifier)) = segments.split_last() else {
@@ -1043,11 +2343,21 @@ impl HandlerIndex {
                 return (None, HandlerResolution::Unresolved);
             };
             let mut visited = HashSet::new();
-            let lookup =
-                match self.resolve_item(crate_key, &qualifier_module, name, &mut visited, 0) {
-                    Lookup::Found(index, _) => Lookup::Found(index, HandlerResolution::Qualified),
-                    other => other,
-                };
+            let lookup = match self.resolve_item(
+                &qualifier_module.0,
+                &qualifier_module.1,
+                name,
+                &mut visited,
+                0,
+            ) {
+                Lookup::Found(index, _) => Lookup::Found(index, HandlerResolution::Qualified),
+                other => other,
+            };
+            let lookup = if qualifier_module.0 != crate_key {
+                self.exported_lookup(&qualifier_module, name, lookup)
+            } else {
+                lookup
+            };
             (lookup, Some(qualifier_module))
         };
 
@@ -1058,9 +2368,11 @@ impl HandlerIndex {
             Lookup::NotFound { explicit: false } => {
                 let candidates: Vec<usize> = self
                     .definitions_named(crate_key, name)
+                    .filter(|&index| self.definitions[index].owner.is_none())
                     .filter(|&index| {
                         qualifier_module.as_ref().is_none_or(|qualifier| {
-                            self.definitions[index].module.starts_with(qualifier)
+                            self.definitions[index].crate_key == qualifier.0
+                                && self.definitions[index].module.starts_with(&qualifier.1)
                         })
                     })
                     .collect();
@@ -1092,16 +2404,25 @@ impl HandlerIndex {
         crate_key: &Path,
         module: &[String],
         name: &str,
-        visited: &mut HashSet<(Vec<String>, String)>,
+        visited: &mut HashSet<(PathBuf, Vec<String>, String)>,
         depth: usize,
     ) -> Lookup {
-        if depth > MAX_RESOLUTION_DEPTH || !visited.insert((module.to_vec(), name.to_owned())) {
+        if depth > MAX_RESOLUTION_DEPTH
+            || !visited.insert((crate_key.to_path_buf(), module.to_vec(), name.to_owned()))
+        {
             return Lookup::NotFound { explicit: true };
         }
 
         let local: Vec<usize> = self
             .definitions_named(crate_key, name)
-            .filter(|&index| self.definitions[index].module == module)
+            .filter(|&index| {
+                self.definitions[index]
+                    .owner
+                    .as_ref()
+                    .map(|k| k.1.as_slice())
+                    .unwrap_or(&self.definitions[index].module)
+                    == module
+            })
             .collect();
         match local.as_slice() {
             [index] => return Lookup::Found(*index, HandlerResolution::Local),
@@ -1121,11 +2442,32 @@ impl HandlerIndex {
                 .unwrap_or(Lookup::NotFound { explicit: true });
         }
 
+        if scope.globs.iter().any(|glob| {
+            self.resolve_module(crate_key, module, glob, depth + 1)
+                .is_none()
+        }) {
+            // An unknown glob could export the same name; do not select a known
+            // branch merely because the other dependency was not indexed.
+            return Lookup::NotFound { explicit: true };
+        }
         let lookups = scope
             .globs
             .iter()
             .filter_map(|glob| self.resolve_module(crate_key, module, glob, depth + 1))
-            .map(|glob_module| self.resolve_item(crate_key, &glob_module, name, visited, depth + 1))
+            .map(|glob_module| {
+                let lookup = self.resolve_item(
+                    &glob_module.0,
+                    &glob_module.1,
+                    name,
+                    &mut visited.clone(),
+                    depth + 1,
+                );
+                if glob_module.0 != crate_key {
+                    self.exported_lookup(&glob_module, name, lookup)
+                } else {
+                    lookup
+                }
+            })
             .collect();
         combine_lookups(lookups, HandlerResolution::GlobImported)
             .unwrap_or(Lookup::NotFound { explicit: false })
@@ -1136,7 +2478,7 @@ impl HandlerIndex {
         crate_key: &Path,
         module: &[String],
         path: &UsePath,
-        visited: &mut HashSet<(Vec<String>, String)>,
+        visited: &mut HashSet<(PathBuf, Vec<String>, String)>,
         depth: usize,
     ) -> Lookup {
         let Some((name, prefix)) = path.segments.split_last() else {
@@ -1150,64 +2492,117 @@ impl HandlerIndex {
             leading_colon: path.leading_colon,
         };
         match self.resolve_module(crate_key, module, &prefix, depth) {
-            Some(target) => match self.resolve_item(crate_key, &target, name, visited, depth) {
-                Lookup::NotFound { .. } => Lookup::NotFound { explicit: true },
-                lookup => lookup,
-            },
+            Some(target) => {
+                let lookup = self.resolve_item(&target.0, &target.1, name, visited, depth);
+                if target.0 != crate_key {
+                    self.exported_lookup(&target, name, lookup)
+                } else {
+                    match lookup {
+                        Lookup::NotFound { .. } => Lookup::NotFound { explicit: true },
+                        other => other,
+                    }
+                }
+            }
             None => Lookup::NotFound { explicit: true },
         }
     }
 
-    /// Resolves a module path written in `module` to an absolute module path
-    /// within the crate. Paths into other crates return `None`.
+    /// Resolve modules/types through dependency aliases and each qualified
+    /// re-export segment. Public access is checked on the written external path.
     fn resolve_module(
         &self,
         crate_key: &Path,
         module: &[String],
         path: &UsePath,
         depth: usize,
-    ) -> Option<Vec<String>> {
-        if path.leading_colon || depth > MAX_RESOLUTION_DEPTH {
+    ) -> Option<ModuleKey> {
+        self.module_path(crate_key, module, path, depth, false)
+    }
+
+    fn module_path(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        path: &UsePath,
+        depth: usize,
+        external: bool,
+    ) -> Option<ModuleKey> {
+        if depth > MAX_RESOLUTION_DEPTH {
             return None;
         }
         let segments = &path.segments;
-        let (mut resolved, rest): (Vec<String>, &[String]) =
-            match segments.first().map(String::as_str) {
-                None => return Some(module.to_vec()),
-                Some("crate") => (Vec::new(), &segments[1..]),
-                Some("self") => (module.to_vec(), &segments[1..]),
-                Some("super") => {
-                    let supers = segments
-                        .iter()
-                        .take_while(|segment| *segment == "super")
-                        .count();
-                    if supers > module.len() {
+        let first = segments.first().map(String::as_str);
+        let mut key = crate_key.to_path_buf();
+        let mut resolved = module.to_vec();
+        let mut position = 0;
+        match first {
+            Some("crate") => {
+                resolved.clear();
+                position = 1;
+            }
+            Some("self") => {
+                position = 1;
+            }
+            Some("super") => {
+                let supers = segments
+                    .iter()
+                    .take_while(|s| s.as_str() == "super")
+                    .count();
+                if supers > module.len() {
+                    return None;
+                }
+                resolved.truncate(module.len() - supers);
+                position = supers;
+            }
+            Some(name) => {
+                let mut child = resolved.clone();
+                child.push(name.into());
+                let local = self.is_module(&key, &child)
+                    || self
+                        .scope(&key, &resolved)
+                        .is_some_and(|s| s.imports.contains_key(name));
+                if path.leading_colon || !local {
+                    if let Some(dependency) = self.dependencies.get(&(key.clone(), name.into())) {
+                        return self.module_path(
+                            dependency,
+                            &[],
+                            &UsePath {
+                                segments: segments[1..].to_vec(),
+                                leading_colon: false,
+                            },
+                            depth + 1,
+                            true,
+                        );
+                    }
+                    if path.leading_colon {
                         return None;
                     }
-                    (
-                        module[..module.len() - supers].to_vec(),
-                        &segments[supers..],
-                    )
                 }
-                Some(first) => {
-                    let mut child = module.to_vec();
-                    child.push(first.to_owned());
-                    if self.is_module(crate_key, &child) {
-                        (child, &segments[1..])
-                    } else {
-                        let imports = self.scope(crate_key, module)?.imports.get(first)?;
-                        let [import] = imports.as_slice() else {
-                            return None;
-                        };
-                        (
-                            self.resolve_module(crate_key, module, import, depth + 1)?,
-                            &segments[1..],
-                        )
-                    }
+            }
+            None => return Some((key, resolved)),
+        }
+        for segment in &segments[position..] {
+            let mut child = resolved.clone();
+            child.push(segment.clone());
+            if self.is_module(&key, &child) {
+                if external && !self.public_modules.contains(&(key.clone(), child.clone())) {
+                    return None;
                 }
-            };
-        resolved.extend(rest.iter().cloned());
-        self.is_module(crate_key, &resolved).then_some(resolved)
+                resolved = child;
+            } else {
+                let scope = self.scope(&key, &resolved)?;
+                if external && !scope.public_imports.contains(segment) {
+                    return None;
+                }
+                let [import] = scope.imports.get(segment)?.as_slice() else {
+                    return None;
+                };
+                // A public re-export may legitimately point into a private
+                // implementation module. Check its export, not that private path.
+                (key, resolved) = self.module_path(&key, &resolved, import, depth + 1, false)?;
+            }
+        }
+        self.is_module(&key, &resolved).then_some((key, resolved))
     }
 }
 
@@ -1605,6 +3000,17 @@ fn evidence_for_handler_symbol(
             strength: AuthStrength::Weak,
         });
     }
+    if symbol.contains("UnknownSecurity") || name == "custom_auth_marker" {
+        return Some(AuthEvidence {
+            kind: AuthEvidenceKind::Unknown,
+            mechanism: name.into(),
+            symbol: Some(symbol.into()),
+            file: file.to_path_buf(),
+            line,
+            handler: Some(handler.into()),
+            strength: AuthStrength::Weak,
+        });
+    }
     None
 }
 
@@ -1806,7 +3212,7 @@ fn is_scope_call(expr: &Expr) -> bool {
     )
 }
 
-/// The argument of a route's `.to(...)` call.
+/// The argument of a route's `.to(...)` or legacy `.to_async(...)` call.
 #[derive(Debug, Clone)]
 enum HandlerTarget {
     Path {
@@ -1842,27 +3248,42 @@ impl HandlerTarget {
 
 fn find_handler(
     exprs: &syn::punctuated::Punctuated<Expr, syn::token::Comma>,
+    index: &HandlerIndex,
+    context: &ModuleKey,
 ) -> Option<HandlerTarget> {
-    exprs.iter().find_map(find_handler_in_expr)
+    exprs
+        .iter()
+        .find_map(|expr| find_handler_in_expr(expr, index, context))
 }
 
-fn find_handler_in_expr(expr: &Expr) -> Option<HandlerTarget> {
+fn find_handler_in_expr(
+    expr: &Expr,
+    index: &HandlerIndex,
+    context: &ModuleKey,
+) -> Option<HandlerTarget> {
     match expr {
-        Expr::MethodCall(method) if method.method == "to" => Some(match method.args.first()? {
-            Expr::Path(path) if path.qself.is_none() => HandlerTarget::Path {
-                segments: path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect(),
-                leading_colon: path.path.leading_colon.is_some(),
-            },
-            _ => HandlerTarget::Other,
-        }),
-        Expr::MethodCall(method) => {
-            find_handler(&method.args).or_else(|| find_handler_in_expr(&method.receiver))
+        Expr::MethodCall(method)
+            if method.method == "to_async"
+                && registration::resolved_route_builder(index, context, &method.receiver)
+                    .is_none() =>
+        {
+            Some(HandlerTarget::Other)
         }
+        Expr::MethodCall(method) if method.method == "to" || method.method == "to_async" => {
+            Some(match method.args.first()? {
+                Expr::Path(path) if path.qself.is_none() => HandlerTarget::Path {
+                    segments: path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect(),
+                    leading_colon: path.path.leading_colon.is_some(),
+                },
+                _ => HandlerTarget::Other,
+            })
+        }
+        Expr::MethodCall(method) => find_handler_in_expr(&method.receiver, index, context),
         _ => None,
     }
 }
@@ -1878,6 +3299,18 @@ fn join_paths(prefix: &str, path: &str) -> String {
     }
 }
 
+// Identity used by comparison coverage and overlap detection. This deliberately
+// differs from source-registration and mounted-route deduplication identities.
+fn comparison_key(route: &RouteReference) -> String {
+    format!(
+        "{:?}:{}:{}:{}",
+        route.application,
+        route.file.display(),
+        route.method,
+        route.path
+    )
+}
+
 pub fn analyze_repository(root: &Path) -> Result<Report> {
     let mut files_scanned = 0;
     let mut parse_errors = Vec::new();
@@ -1885,6 +3318,14 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
 
     let mut rust_files: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| {
+            entry.path() == root
+                || !entry.file_type().is_dir()
+                || !matches!(
+                    entry.file_name().to_str(),
+                    Some("target" | ".git" | "tests" | "benches" | "examples")
+                )
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
@@ -1898,32 +3339,182 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
             .with_context(|| format!("failed to read {}", file_path.display()))?;
 
         files_scanned += 1;
-        let syntax = match syn::parse_file(&source) {
+        let mut syntax = match syn::parse_file(&source) {
             Ok(syntax) => syntax,
             Err(error) => {
                 parse_errors.push(format!("{}: {}", file_path.display(), error));
                 continue;
             }
         };
+        registration::strip_test_items(&mut syntax.items);
         parsed_files.push((module_location(root, &file_path), file_path, syntax));
     }
 
     // Index every handler definition before extracting routes so that route
     // registrations can resolve handlers defined in other files.
-    let index = HandlerIndex::build(
+    let mut index = HandlerIndex::build(
         parsed_files
             .iter()
             .map(|(location, file_path, syntax)| (file_path.as_path(), location.clone(), syntax)),
     );
+    let mut diagnostics = Vec::new();
+    if let Some(message) = index.load_workspace(root) {
+        diagnostics.push(registration::Diagnostic {
+            code: "workspace_resolution_unavailable".into(),
+            file: root.to_path_buf(),
+            line: 1,
+            message,
+        });
+    }
+    index.attach_conditional_result_aliases();
+    index.attach_diesel_tables();
+    let mut mounted_routes = Vec::new();
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
+        visitor.conservative_security = true;
         visitor.visit_file(syntax);
         routes.extend(visitor.routes);
+        mounted_routes.extend(visitor.mounted_routes);
+        diagnostics.extend(visitor.diagnostics);
     }
 
-    let (peer_groups, invariants, finding_details, findings) = build_analysis_layers(&routes);
+    diagnostics.extend(registration::missing_context(
+        &routes,
+        &mounted_routes,
+        &index,
+    ));
+    registration::merge_mounts(&mut routes, mounted_routes);
+    let security_assessments = security::assess(&mut routes, &parsed_files, &index);
+    let (candidate_relationships, resource_evidence) =
+        policy_drift::discover(root, &routes, &index);
+    let peer_groups = policy_drift::families(&routes, &candidate_relationships);
+    let mut invariants = Vec::new();
+    let mut finding_details = Vec::new();
+    let mut findings = Vec::new();
+    let mut compared = HashSet::new();
+    let mut analysis_evidence = Vec::new();
+    policy_drift::infer(
+        &peer_groups,
+        &security_assessments,
+        &mut finding_details,
+        &mut findings,
+        &mut invariants,
+        &mut compared,
+        &mut analysis_evidence,
+    );
+    analysis_evidence.extend(policy_drift::group_evidence(
+        &peer_groups,
+        &routes,
+        &candidate_relationships,
+        &invariants,
+        &security_assessments,
+    ));
+    for group in &peer_groups {
+        if !invariants.iter().any(|i| i.peer_group_id == group.id) {
+            diagnostics.push(registration::Diagnostic {
+                code: "invariant_unavailable".into(), file: group.routes[0].file.clone(), line: group.routes[0].line,
+                message: format!("{}: no unambiguous observed requirement has at least two supporters and a strict group majority; unknown checks and legitimate policy differences do not establish an invariant", group.id),
+            });
+        }
+    }
+    let peer_compared_routes = compared.len();
+    for (i, route) in routes.iter().enumerate() {
+        let key = comparison_key(&RouteReference::from(route));
+        if compared.contains(&key) {
+            continue;
+        }
+        let related: Vec<_> = candidate_relationships
+            .iter()
+            .filter(|r| r.left == i || r.right == i)
+            .collect();
+        let reason = if related.is_empty() {
+            "No supported resource or structural relationship within this application"
+        } else if !peer_groups.iter().any(|g| {
+            g.routes
+                .iter()
+                .any(|p| policy_drift::same_route(p, &RouteReference::from(route)))
+        }) {
+            "Structural relationships exist, but insufficient shared resource evidence supports peer membership"
+        } else {
+            "Peer group membership exists, but held-out policy evidence is unresolved, insufficient, ambiguous, or conflicting; no supported drift comparison was made"
+        };
+        diagnostics.push(registration::Diagnostic {
+            code: "policy_comparison_unavailable".into(),
+            file: route.file.clone(),
+            line: route.line,
+            message: format!("{} {}: {reason}", route.method, route.path),
+        });
+    }
 
+    let protected_routes = routes
+        .iter()
+        .filter(|r| matches!(r.security_status(), RouteSecurityStatus::Protected))
+        .count();
+    let unknown_routes = routes
+        .iter()
+        .filter(|r| matches!(r.security_status(), RouteSecurityStatus::Unknown { .. }))
+        .count();
+    let unprotected_routes = routes
+        .len()
+        .saturating_sub(protected_routes + unknown_routes);
+
+    let summary = Some(AnalysisSummary {
+        total_routes: routes.len(),
+        peer_group_covered_routes: routes
+            .iter()
+            .filter(|r| {
+                peer_groups.iter().any(|g| {
+                    g.routes
+                        .iter()
+                        .any(|p| policy_drift::same_route(p, &RouteReference::from(*r)))
+                })
+            })
+            .count(),
+        peer_compared_routes,
+        routes_without_peer_comparison: routes.len().saturating_sub(peer_compared_routes),
+        protected_routes,
+        unprotected_routes,
+        unknown_routes,
+        peer_groups_count: peer_groups.len(),
+        inferred_invariants_count: invariants.len(),
+        drift_findings_count: finding_details.len(),
+    });
+
+    let handler_resolution_evidence: Vec<_> = routes
+        .iter()
+        .map(|route| {
+            let definition = index.route_handler(route);
+            HandlerResolutionEvidence {
+                route: RouteReference::from(route),
+                definition_file: definition.map(|d| d.file.clone()),
+                definition_line: definition.map(|d| d.function.sig.ident.span().start().line),
+                definition_path: definition.map(HandlerDefinition::rust_path),
+                confidence: if definition.is_none() {
+                    "Unavailable"
+                } else if route.handler_resolution == Some(HandlerResolution::UniqueName) {
+                    "Low"
+                } else {
+                    "Medium"
+                }
+                .into(),
+            }
+        })
+        .collect();
+
+    let graph = Some(reporting::graph_with_definitions(&routes, &finding_details, &handler_resolution_evidence, &security_assessments));
+    let local_rejections = security::local_rejections(&routes, &index);
+    let review_observations = policy_drift::reviews(&peer_groups, &security_assessments, &finding_details);
+    let check_comparisons = security::check_contrasts(&routes, &candidate_relationships, &security_assessments, &index);
     Ok(Report {
+        check_comparisons,
+        review_observations,
+        local_rejections,
+        candidate_relationships,
+        analysis_evidence,
+        resource_evidence,
+        handler_resolution_evidence,
+        security_assessments,
+        diagnostics,
         files_scanned,
         parse_errors,
         routes,
@@ -1931,209 +3522,29 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
         invariants,
         findings,
         finding_details,
+        graph,
+        summary,
+        diff_report: None,
     })
 }
 
-fn build_analysis_layers(
-    routes: &[Route],
-) -> (
-    Vec<PeerGroup>,
-    Vec<AuthorizationInvariant>,
-    Vec<Finding>,
-    Vec<String>,
-) {
-    let mut grouped_routes: Vec<Vec<&Route>> = Vec::new();
-    for route in routes {
-        if is_authentication_route(route)
-            || grouped_routes.iter().any(|group| {
-                group
-                    .iter()
-                    .any(|candidate| route_identity(candidate) == route_identity(route))
-            })
-        {
-            continue;
-        }
-        let peers = unique_routes(
-            routes
-                .iter()
-                .filter(|candidate| same_peer_group(route, candidate)),
-        );
-        if peers.len() >= 2 && peers.iter().any(|peer| peer.is_authorized()) {
-            grouped_routes.push(peers);
-        }
-    }
-
-    let mut peer_groups = Vec::new();
-    let mut invariants = Vec::new();
-    let mut finding_details = Vec::new();
-    let mut findings = Vec::new();
-
-    for (index, peers) in grouped_routes.iter().enumerate() {
-        let id = format!("peer-group-{:03}", index + 1);
-        let first = peers[0];
-        let description = format!(
-            "{} {} routes under {}",
-            first.method,
-            route_shape_description(first),
-            if first.scope_prefix.is_empty() {
-                "/"
-            } else {
-                &first.scope_prefix
-            }
-        );
-        let references: Vec<RouteReference> = peers.iter().map(|route| (*route).into()).collect();
-        peer_groups.push(PeerGroup {
-            id: id.clone(),
-            description: description.clone(),
-            routes: references.clone(),
-        });
-
-        let authorized = peers.iter().filter(|route| route.is_authorized()).count();
-        let unauthorized = peers.len() - authorized;
-        let mut evidence_patterns: Vec<String> = peers
-            .iter()
-            .flat_map(|route| {
-                route
-                    .authorization
-                    .iter()
-                    .map(|evidence| evidence.mechanism.clone())
-            })
-            .collect();
-        evidence_patterns.sort();
-        evidence_patterns.dedup();
-        let strength = invariant_strength(authorized, peers.len());
-        let invariant = AuthorizationInvariant {
-            peer_group_id: id.clone(),
-            description: format!(
-                "Peer routes under {} consistently contain authorization evidence.",
-                if first.scope_prefix.is_empty() {
-                    "/"
-                } else {
-                    &first.scope_prefix
-                }
-            ),
-            total_routes: peers.len(),
-            routes_with_authorization: authorized,
-            routes_without_authorization: unauthorized,
-            evidence_patterns,
-            strength,
-        };
-        invariants.push(invariant.clone());
-
-        if authorized < 2 || unauthorized == 0 {
-            continue;
-        }
-        for route in peers.iter().filter(|route| !route.is_authorized()) {
-            let authorized_peer_routes: Vec<RouteReference> = peers
-                .iter()
-                .filter(|peer| peer.is_authorized())
-                .map(|peer| (*peer).into())
-                .collect();
-            finding_details.push(Finding {
-                peer_group_id: id.clone(),
-                invariant: invariant.clone(),
-                suspicious_route: (*route).into(),
-                suspicious_route_evidence: route.authorization.clone(),
-                authorized_peer_routes,
-            });
-            let peer_lines = peers
-                .iter()
-                .filter(|peer| peer.is_authorized())
-                .map(|peer| {
-                    format!(
-                        "    - {} {}\n      {}",
-                        peer.method,
-                        peer.path,
-                        format_evidence(peer)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            findings.push(format!(
-                "  Suspicious route: {} {} ({}:{})\n\
-  Inferred invariant: {}\n\
-  Authorized peer evidence ({} route(s)):\n{}\n\
-  Suspicious route evidence: {}.",
-                route.method,
-                route.path,
-                route.file.display(),
-                route.line,
-                invariant.description,
-                authorized,
-                peer_lines,
-                format_evidence(route)
-            ));
-        }
-    }
-
-    (peer_groups, invariants, finding_details, findings)
-}
-
-fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
-    build_analysis_layers(routes).3
-}
-
-fn invariant_strength(authorized: usize, total: usize) -> AuthStrength {
-    if authorized == total || authorized >= 3 {
-        AuthStrength::Strong
-    } else if authorized >= 2 {
-        AuthStrength::Medium
-    } else {
-        AuthStrength::Weak
-    }
-}
-
-fn route_shape_description(route: &Route) -> String {
-    if dynamic_segment_shape(route).iter().any(|dynamic| *dynamic) {
-        "parameterized".into()
-    } else {
-        "static".into()
-    }
-}
-
-fn format_evidence(route: &Route) -> String {
-    if route.authorization.is_empty() {
-        return "No recognized authorization evidence".into();
-    }
-    route
-        .authorization
-        .iter()
-        .map(|evidence| {
-            format!(
-                "{:?}: {} at {}:{} ({:?})",
-                evidence.kind,
-                evidence.mechanism,
-                evidence.file.display(),
-                evidence.line,
-                evidence.strength
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn same_peer_group(route: &Route, candidate: &Route) -> bool {
-    if route.scope_prefix != candidate.scope_prefix
-        || route.method != candidate.method
-        || route_segment_count(route) != route_segment_count(candidate)
-        || dynamic_segment_shape(route) != dynamic_segment_shape(candidate)
-    {
-        return false;
-    }
-
-    if is_authentication_route(route) || is_authentication_route(candidate) {
-        return route.path == candidate.path;
-    }
-
-    true
-}
-
-fn route_segment_count(route: &Route) -> usize {
-    route
+fn is_operational_public_route(route: &Route) -> bool {
+    let public_operational_names = [
+        "health", "healthz", "live", "ready", "status", "ping", "metrics", "version", "info",
+        "docs", "swagger", "openapi", "favicon",
+    ];
+    let path_segments: Vec<String> = route
         .path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .count()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if let Some(last) = path_segments.last() {
+        if public_operational_names.contains(&last.as_str()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn dynamic_segment_shape(route: &Route) -> Vec<bool> {
@@ -2163,2400 +3574,5 @@ fn is_authentication_route(route: &Route) -> bool {
         .any(|segment| authentication_names.contains(&segment.as_str()))
 }
 
-fn unique_routes<'a, I>(routes: I) -> Vec<&'a Route>
-where
-    I: IntoIterator<Item = &'a Route>,
-{
-    let mut unique: Vec<&'a Route> = Vec::new();
-    for route in routes {
-        if !unique
-            .iter()
-            .any(|candidate| route_identity(candidate) == route_identity(route))
-        {
-            unique.push(route);
-        }
-    }
-    unique
-}
-
-fn route_identity(route: &Route) -> (&str, &str, &str, Option<&str>) {
-    (
-        &route.method,
-        &route.path,
-        &route.scope_prefix,
-        route.handler.as_deref(),
-    )
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> Route {
-        let authorization = if authorization == "PRESENT" {
-            vec![AuthEvidence {
-                kind: AuthEvidenceKind::RoleCheck,
-                mechanism: "test_authorization".into(),
-                symbol: Some("test_authorization".into()),
-                file: PathBuf::from("fixture.rs"),
-                line: 1,
-                handler: None,
-                strength: AuthStrength::Strong,
-            }]
-        } else {
-            Vec::new()
-        };
-        Route {
-            method: method.into(),
-            path: path.into(),
-            scope_prefix: scope_prefix.into(),
-            handler: None,
-            handler_path: None,
-            handler_resolution: None,
-            authorization,
-            line: 1,
-            file: PathBuf::from("fixture.rs"),
-        }
-    }
-
-    fn route_with_handler(
-        method: &str,
-        path: &str,
-        scope_prefix: &str,
-        handler: &str,
-        authorization: &str,
-    ) -> Route {
-        let mut route = route(method, path, scope_prefix, authorization);
-        route.handler = Some(handler.into());
-        route
-    }
-
-    #[test]
-    fn peer_groups_require_matching_scope_method_and_shape() {
-        let suspicious = route("GET", "/admin/payments", "/admin", "NONE");
-        let same_group = route("GET", "/admin/users", "/admin", "PRESENT");
-        let different_method = route("POST", "/admin/orders", "/admin", "PRESENT");
-        let different_shape = route("GET", "/admin/reports/daily", "/admin", "PRESENT");
-        let different_scope = route("GET", "/public/users", "/public", "PRESENT");
-
-        assert!(same_peer_group(&suspicious, &same_group));
-        assert!(!same_peer_group(&suspicious, &different_method));
-        assert!(!same_peer_group(&suspicious, &different_shape));
-        assert!(!same_peer_group(&suspicious, &different_scope));
-    }
-
-    #[test]
-    fn authentication_login_and_logout_are_not_peers() {
-        let login = route("POST", "/api/auth/login", "/api/auth", "NONE");
-        let logout = route("POST", "/api/auth/logout", "/api/auth", "PRESENT");
-
-        assert!(is_authentication_route(&login));
-        assert!(is_authentication_route(&logout));
-        assert!(!same_peer_group(&login, &logout));
-    }
-
-    #[test]
-    fn authentication_register_and_logout_are_not_peers() {
-        let register = route("POST", "/api/auth/register", "/api/auth", "NONE");
-        let logout = route("POST", "/api/auth/logout", "/api/auth", "PRESENT");
-
-        assert!(!same_peer_group(&register, &logout));
-    }
-
-    #[test]
-    fn structurally_similar_protected_routes_remain_peers() {
-        let users = route("GET", "/api/admin/users", "/api/admin", "PRESENT");
-        let orders = route("GET", "/api/admin/orders", "/api/admin", "PRESENT");
-        let payments = route("GET", "/api/admin/payments", "/api/admin", "NONE");
-
-        assert!(same_peer_group(&users, &orders));
-        assert!(same_peer_group(&payments, &users));
-    }
-
-    #[test]
-    fn public_routes_under_broad_api_prefix_are_not_flagged() {
-        let routes = vec![
-            route("POST", "/api/auth/login", "/api/auth", "NONE"),
-            route("POST", "/api/auth/register", "/api/auth", "NONE"),
-            route("POST", "/api/auth/logout", "/api/auth", "PRESENT"),
-        ];
-
-        let findings = infer_prototype_drift(&routes);
-
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn duplicate_route_observations_do_not_dominate_peer_inference() {
-        let public = route_with_handler("GET", "/api/admin/public", "/api/admin", "public", "NONE");
-        let protected =
-            route_with_handler("GET", "/api/admin/users", "/api/admin", "users", "PRESENT");
-        let duplicate_protected = protected.clone();
-
-        let protected_orders = route_with_handler(
-            "GET",
-            "/api/admin/orders",
-            "/api/admin",
-            "orders",
-            "PRESENT",
-        );
-        let findings =
-            infer_prototype_drift(&[public, protected, protected_orders, duplicate_protected]);
-
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].contains("/api/admin/public"));
-        assert_eq!(findings[0].matches("/api/admin/users").count(), 1);
-    }
-
-    #[test]
-    fn analysis_layers_expose_group_invariant_and_finding_relationship() {
-        let routes = vec![
-            route("GET", "/admin/users", "/admin", "PRESENT"),
-            route("GET", "/admin/orders", "/admin", "PRESENT"),
-            route("GET", "/admin/reports", "/admin", "PRESENT"),
-            route("GET", "/admin/payments", "/admin", "NONE"),
-        ];
-
-        let (groups, invariants, details, findings) = build_analysis_layers(&routes);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].routes.len(), 4);
-        assert_eq!(invariants.len(), 1);
-        assert_eq!(invariants[0].peer_group_id, groups[0].id);
-        assert_eq!(invariants[0].total_routes, 4);
-        assert_eq!(invariants[0].routes_with_authorization, 3);
-        assert_eq!(invariants[0].routes_without_authorization, 1);
-        assert_eq!(invariants[0].evidence_patterns, vec!["test_authorization"]);
-        assert_eq!(invariants[0].strength, AuthStrength::Strong);
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].peer_group_id, groups[0].id);
-        assert_eq!(details[0].invariant.routes_without_authorization, 1);
-        assert_eq!(details[0].suspicious_route.path, "/admin/payments");
-        assert_eq!(findings.len(), 1);
-    }
-
-    #[test]
-    fn authentication_routes_do_not_create_report_layers() {
-        let routes = vec![
-            route("POST", "/api/auth/login", "/api/auth", "NONE"),
-            route("POST", "/api/auth/register", "/api/auth", "NONE"),
-            route("POST", "/api/auth/logout", "/api/auth", "PRESENT"),
-        ];
-
-        let (groups, invariants, details, findings) = build_analysis_layers(&routes);
-
-        assert!(groups.is_empty());
-        assert!(invariants.is_empty());
-        assert!(details.is_empty());
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn drift_finding_excludes_structural_non_peers() {
-        let routes = vec![
-            route("GET", "/admin/payments", "/admin", "NONE"),
-            route("GET", "/admin/users", "/admin", "PRESENT"),
-            route("GET", "/admin/orders", "/admin", "PRESENT"),
-            route("GET", "/admin/reports", "/admin", "PRESENT"),
-            route("POST", "/admin/audit", "/admin", "NONE"),
-        ];
-
-        let findings = infer_prototype_drift(&routes);
-
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].contains("/admin/payments"));
-        assert!(!findings[0].contains("/admin/audit"));
-    }
-
-    #[test]
-    fn nested_scopes_keep_combined_prefix() {
-        let syntax: syn::File = syn::parse_str(
-            "fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope(\"/api\").service(
-                    web::scope(\"/admin\").route(\"/users\", web::get())
-                ));
-            }",
-        )
-        .unwrap();
-        let index = HandlerIndex::default();
-        let mut visitor = RouteVisitor::new(PathBuf::from("nested.rs"), &index);
-        visitor.visit_file(&syntax);
-
-        assert_eq!(visitor.routes[0].path, "/api/admin/users");
-        assert_eq!(visitor.routes[0].scope_prefix, "/api/admin");
-    }
-
-    #[test]
-    fn sibling_nested_scopes_extract_routes_and_preserve_admin_drift_evidence() {
-        let syntax: syn::File = syn::parse_str(
-            r#"
-            fn require_admin() {}
-            async fn admin_users() { require_admin(); }
-            async fn admin_orders() { require_admin(); }
-            async fn admin_reports() { require_admin(); }
-            async fn admin_payments() {}
-            async fn admin_audit() { require_admin(); }
-            async fn manager_audit() {}
-            async fn manager_exports() {}
-            async fn finance_summary() {}
-            async fn finance_transactions() {}
-            async fn get_document() {}
-            async fn get_document_history() {}
-            async fn health() {}
-            async fn readiness() {}
-
-            #[get("/api/profile")]
-            async fn profile() {}
-            #[get("/api/public-info")]
-            async fn public_info() {}
-            #[post("/api/session")]
-            async fn create_session() {}
-
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(
-                    web::scope("/api")
-                        .service(web::scope("/admin")
-                            .route("/users", web::get().to(admin_users))
-                            .route("/orders", web::get().to(admin_orders))
-                            .route("/reports", web::get().to(admin_reports))
-                            .route("/payments", web::get().to(admin_payments))
-                            .route("/audit", web::post().to(admin_audit)))
-                        .service(web::scope("/manager")
-                            .route("/audit", web::get().to(manager_audit))
-                            .route("/exports", web::get().to(manager_exports)))
-                        .service(web::scope("/finance")
-                            .route("/summary", web::get().to(finance_summary))
-                            .route("/transactions", web::get().to(finance_transactions)))
-                        .service(web::scope("/documents")
-                            .route("/{id}", web::get().to(get_document))
-                            .route("/{id}/history", web::get().to(get_document_history)))
-                        .service(web::scope("/public")
-                            .route("/health", web::get().to(health))
-                            .route("/ready", web::get().to(readiness)))
-                );
-            }
-            "#,
-        )
-        .unwrap();
-        let file = Path::new("siblings.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-
-        assert_eq!(visitor.routes.len(), 16);
-        for (method, path) in [
-            ("GET", "/api/admin/users"),
-            ("GET", "/api/admin/orders"),
-            ("GET", "/api/admin/reports"),
-            ("GET", "/api/admin/payments"),
-            ("POST", "/api/admin/audit"),
-            ("GET", "/api/manager/audit"),
-            ("GET", "/api/manager/exports"),
-            ("GET", "/api/finance/summary"),
-            ("GET", "/api/finance/transactions"),
-            ("GET", "/api/documents/{id}"),
-            ("GET", "/api/documents/{id}/history"),
-            ("GET", "/api/public/health"),
-            ("GET", "/api/public/ready"),
-            ("GET", "/api/profile"),
-            ("GET", "/api/public-info"),
-            ("POST", "/api/session"),
-        ] {
-            assert!(visitor.routes.iter().any(|route| route.method == method && route.path == path), "missing {method} {path}");
-        }
-
-        for route in &visitor.routes {
-            let expected_scope = ["admin", "manager", "finance", "documents", "public"]
-                .iter()
-                .find(|scope| route.path.starts_with(&format!("/api/{scope}/")))
-                .map(|scope| format!("/api/{scope}"))
-                .unwrap_or_default();
-            assert_eq!(route.scope_prefix, expected_scope, "wrong scope for {} {}", route.method, route.path);
-        }
-
-        for handler in ["admin_users", "admin_orders", "admin_reports"] {
-            let route = visitor.routes.iter().find(|route| route.handler.as_deref() == Some(handler)).unwrap();
-            assert_eq!(route.authorization.len(), 1);
-            assert_eq!(route.authorization[0].mechanism, "require_admin");
-            assert_eq!(route.authorization[0].handler.as_deref(), Some(handler));
-        }
-        let audit = visitor.routes.iter().find(|route| route.path == "/api/admin/audit").unwrap();
-        assert_eq!(audit.method, "POST");
-
-        let (groups, invariants, details, findings) = build_analysis_layers(&visitor.routes);
-        let admin_group = groups.iter().find(|group| {
-            group.routes.iter().any(|route| route.path == "/api/admin/payments")
-        }).unwrap();
-        assert_eq!(admin_group.routes.len(), 4);
-        assert!(admin_group.routes.iter().all(|route| route.method == "GET"));
-        assert_eq!(invariants.len(), 1);
-        assert_eq!(invariants[0].total_routes, 4);
-        assert_eq!(invariants[0].routes_with_authorization, 3);
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].suspicious_route.path, "/api/admin/payments");
-        assert_eq!(details[0].authorized_peer_routes.len(), 3);
-        assert_eq!(findings.len(), 1);
-    }
-
-    #[test]
-    fn malformed_rust_file_is_reported_and_skipped() {
-        let root = std::env::temp_dir().join(format!("archer-malformed-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("broken.rs"), "fn broken( {").unwrap();
-        fs::write(
-            root.join("valid.rs"),
-            "fn configure(cfg: &mut web::ServiceConfig) { cfg.service(web::scope(\"/admin\").route(\"/users\", web::get())); }",
-        )
-        .unwrap();
-
-        let report = analyze_repository(&root).unwrap();
-        fs::remove_dir_all(&root).unwrap();
-
-        assert_eq!(report.files_scanned, 2);
-        assert_eq!(report.parse_errors.len(), 1);
-        assert!(report.parse_errors[0].contains("broken.rs"));
-        assert_eq!(report.routes.len(), 1);
-    }
-
-    #[test]
-    fn recognizes_authorization_guards_and_middleware_but_not_generic_guards() {
-        let guard: ExprMethodCall =
-            syn::parse_str("web::scope(\"/admin\").route(\"/x\", web::get().guard(AdminGuard))")
-                .unwrap();
-        let middleware: ExprMethodCall = syn::parse_str(
-            "web::scope(\"/admin\").route(\"/x\", web::get().wrap(AuthorizationMiddleware))",
-        )
-        .unwrap();
-        let generic_guard: ExprMethodCall =
-            syn::parse_str("web::scope(\"/admin\").route(\"/x\", web::get().guard(MethodGuard))")
-                .unwrap();
-
-        let guard_evidence = classify_authorization(&guard, None, &[], Path::new("fixture.rs"));
-        assert_eq!(guard_evidence[0].kind, AuthEvidenceKind::AuthorizationGuard);
-        assert_eq!(guard_evidence[0].symbol.as_deref(), Some("AdminGuard"));
-        assert_eq!(guard_evidence[0].line, 1);
-        assert_eq!(guard_evidence[0].strength, AuthStrength::Strong);
-
-        let middleware_evidence =
-            classify_authorization(&middleware, None, &[], Path::new("fixture.rs"));
-        assert_eq!(
-            middleware_evidence[0].kind,
-            AuthEvidenceKind::AuthorizationMiddleware
-        );
-        assert_eq!(
-            middleware_evidence[0].symbol.as_deref(),
-            Some("AuthorizationMiddleware")
-        );
-        assert_eq!(middleware_evidence[0].line, 1);
-
-        let generic_evidence =
-            classify_authorization(&generic_guard, None, &[], Path::new("fixture.rs"));
-        assert!(generic_evidence.is_empty());
-    }
-
-    #[test]
-    fn http_method_extraction_follows_the_route_builder_chain() {
-        // Fixtures are route registrations parsed with `syn`. Constructors and
-        // method constants follow actix-web 4: `web::{get, post, put, patch,
-        // delete, head, trace}`, `web::method(Method::X)`, `web::route()`, and
-        // `Route::method(Method::X)`, which adds a method guard. OPTIONS and
-        // CONNECT have no `web::` constructor and are written with `Method::`.
-        for (route, expected) in [
-            // Cases from the reviewed branch commit 05561a3.
-            (
-                r#"web::scope("/api").route("/users", web::get().to(h))"#,
-                "GET",
-            ),
-            (
-                r#"web::scope("/api").route("/users", web::post().guard(AdminGuard).to(h))"#,
-                "POST",
-            ),
-            (r#"web::scope("/api").route("/users", get().to(h))"#, "GET"),
-            (
-                r#"web::scope("/api").route("/users", actix_web::web::delete().to(h))"#,
-                "DELETE",
-            ),
-            (r#"web::resource("/users").route(web::put().to(h))"#, "PUT"),
-            (
-                r#"web::scope("/api").route("/web/get_users", custom_helper("web::get"))"#,
-                "UNKNOWN",
-            ),
-            // Calls nested in guard, configuration, or handler arguments are ignored.
-            (
-                r#"cfg.route("/mode", web::route().guard(guard::Header("x-mode", config.get("mode"))).to(h))"#,
-                "UNKNOWN",
-            ),
-            (
-                r#"cfg.route("/flag", web::post().guard(guard::fn_guard(|ctx| config.get("flag").is_some())).to(h))"#,
-                "POST",
-            ),
-            (
-                r#"cfg.route("/users", web::post().to(web::get_users))"#,
-                "POST",
-            ),
-            (r#"cfg.route("/users", my_routes::get().to(h))"#, "UNKNOWN"),
-            // Remaining constructors.
-            (r#"cfg.route("/x", web::patch().to(h))"#, "PATCH"),
-            (r#"cfg.route("/x", web::head().to(h))"#, "HEAD"),
-            (r#"cfg.route("/x", web::trace().to(h))"#, "TRACE"),
-            (r#"cfg.route("/x", web::options().to(h))"#, "UNKNOWN"),
-            // `web::method(...)` with qualified constants.
-            (r#"cfg.route("/x", web::method(Method::PUT).to(h))"#, "PUT"),
-            (
-                r#"cfg.route("/x", web::method(http::Method::PUT).to(h))"#,
-                "PUT",
-            ),
-            (
-                r#"cfg.route("/x", actix_web::web::method(actix_web::http::Method::PUT).to(h))"#,
-                "PUT",
-            ),
-            (
-                r#"cfg.route("/x", web::method(Method::OPTIONS).to(h))"#,
-                "OPTIONS",
-            ),
-            (
-                r#"cfg.route("/x", web::method(Method::from_bytes(b"PUT").unwrap()).to(h))"#,
-                "UNKNOWN",
-            ),
-            // `Route::method(...)` on an any-method route.
-            (
-                r#"cfg.route("/x", web::route().method(Method::PUT).to(h))"#,
-                "PUT",
-            ),
-            (
-                r#"cfg.route("/x", web::route().method(http::Method::CONNECT).guard(g).to(h))"#,
-                "CONNECT",
-            ),
-            (
-                r#"cfg.route("/x", Route::new().method(Method::DELETE).to(h))"#,
-                "DELETE",
-            ),
-            (r#"cfg.route("/x", web::route().to(h))"#, "UNKNOWN"),
-            // Method guards that agree keep the method; conflicting ones do not.
-            (
-                r#"cfg.route("/x", web::get().method(Method::GET).to(h))"#,
-                "GET",
-            ),
-            (
-                r#"cfg.route("/x", web::get().method(Method::POST).to(h))"#,
-                "UNKNOWN",
-            ),
-        ] {
-            let call: ExprMethodCall = syn::parse_str(route).unwrap();
-            assert_eq!(extract_http_method(&call), expected, "{route}");
-        }
-    }
-
-    #[test]
-    fn extracted_routes_carry_builder_methods_without_changing_handler_resolution() {
-        let syntax: syn::File = syn::parse_str(
-            r#"
-            fn require_admin() {}
-            async fn get_users() { require_admin(); }
-            async fn h() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/api")
-                    .route("/users", web::post().to(get_users))
-                    .route("/mode", web::route().guard(guard::Header("x-mode", config.get("mode"))).to(h))
-                    .route("/web/get_users", custom_helper("web::get"))
-                    .route("/put", web::route().method(Method::PUT).to(h)));
-            }
-            "#,
-        )
-        .unwrap();
-        let file = Path::new("methods.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let route = |path: &str| {
-            visitor
-                .routes
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("missing route {path}"))
-        };
-
-        assert_eq!(visitor.routes.len(), 4);
-        assert_eq!(route("/api/users").method, "POST");
-        assert_eq!(route("/api/mode").method, "UNKNOWN");
-        assert_eq!(route("/api/web/get_users").method, "UNKNOWN");
-        assert_eq!(route("/api/put").method, "PUT");
-
-        let users = route("/api/users");
-        assert_eq!(users.handler_resolution, Some(HandlerResolution::Local));
-        assert_eq!(users.authorization.len(), 1);
-        assert_eq!(users.authorization[0].mechanism, "require_admin");
-    }
-
-    #[test]
-    fn extracts_attribute_routes_and_associates_handlers() {
-        let syntax: syn::File = syn::parse_str(
-            r#"
-            fn require_admin() {}
-
-            #[get("/admin")]
-            fn admin() {
-                require_admin();
-            }
-
-            #[post("/token")]
-            fn token() {}
-            "#,
-        )
-        .unwrap();
-        let index = HandlerIndex::single_file(Path::new("attributes.rs"), &syntax);
-        let mut visitor = RouteVisitor::new(PathBuf::from("attributes.rs"), &index);
-        visitor.visit_file(&syntax);
-
-        assert_eq!(visitor.routes.len(), 2);
-        assert_eq!(visitor.routes[0].method, "GET");
-        assert_eq!(visitor.routes[0].path, "/admin");
-        assert!(visitor.routes[0].is_authorized());
-        assert_eq!(visitor.routes[0].handler.as_deref(), Some("admin"));
-        assert_eq!(
-            visitor.routes[0].authorization[0].kind,
-            AuthEvidenceKind::RoleCheck
-        );
-        assert_eq!(
-            visitor.routes[0].authorization[0].symbol.as_deref(),
-            Some("require_admin")
-        );
-        assert_eq!(visitor.routes[0].authorization[0].line, 6);
-        assert_eq!(visitor.routes[1].method, "POST");
-        assert_eq!(visitor.routes[1].path, "/token");
-        assert!(!visitor.routes[1].is_authorized());
-    }
-
-    #[test]
-    fn role_check_records_symbol_line_and_handler() {
-        let syntax: syn::File = syn::parse_str("fn admin() { require_admin(); }").unwrap();
-        let handlers = collect_authorized_handlers(Path::new("roles.rs"), &syntax);
-        let evidence = &handlers["admin"][0];
-
-        assert_eq!(evidence.kind, AuthEvidenceKind::RoleCheck);
-        assert_eq!(evidence.mechanism, "require_admin");
-        assert_eq!(evidence.symbol.as_deref(), Some("require_admin"));
-        assert_eq!(evidence.file, PathBuf::from("roles.rs"));
-        assert_eq!(evidence.line, 1);
-        assert_eq!(evidence.handler.as_deref(), Some("admin"));
-        assert_eq!(evidence.strength, AuthStrength::Strong);
-    }
-
-    #[test]
-    fn function_call_evidence_recognizes_checks_without_promoting_identity_or_names() {
-        let syntax: syn::File = syn::parse_str(
-            "fn protected() {
-                check_permission();
-                verify_finance_permission();
-                require_manager();
-                check_resource_owner();
-                require_authenticated_user();
-                admin_dashboard_title();
-                let _ = AuthError::Unauthorized;
-            }",
-        )
-        .unwrap();
-        let handlers = collect_authorized_handlers(Path::new("calls.rs"), &syntax);
-        let evidence = &handlers["protected"];
-
-        assert_eq!(evidence.len(), 5);
-        assert_eq!(evidence[0].kind, AuthEvidenceKind::PermissionCheck);
-        assert_eq!(evidence[0].mechanism, "check_permission");
-        assert_eq!(evidence[0].symbol.as_deref(), Some("check_permission"));
-        assert_eq!(evidence[1].kind, AuthEvidenceKind::PermissionCheck);
-        assert_eq!(evidence[1].mechanism, "verify_finance_permission");
-        assert_eq!(evidence[2].kind, AuthEvidenceKind::RoleCheck);
-        assert_eq!(evidence[2].mechanism, "require_manager");
-        assert_eq!(evidence[3].kind, AuthEvidenceKind::OwnershipCheck);
-        assert_eq!(evidence[3].mechanism, "check_resource_owner");
-        assert_eq!(evidence[4].kind, AuthEvidenceKind::IdentityExtraction);
-        assert_eq!(evidence[4].mechanism, "require_authenticated_user");
-        assert!(evidence.iter().all(|item| item.handler.as_deref() == Some("protected")));
-        assert!(!evidence.iter().any(|item| item.mechanism == "admin_dashboard_title"));
-        assert!(!evidence.iter().any(|item| item.kind == AuthEvidenceKind::IdentityExtraction && item.is_authorization()));
-
-        let error_syntax: syn::File = syn::parse_str(
-            "fn error_only() -> Result<(), AuthError> { Err(AuthError::Forbidden) }
-             fn matches_error(error: AuthError) { match error { AuthError::Forbidden => (), _ => () } }",
-        )
-        .unwrap();
-        let error_handlers = collect_authorized_handlers(Path::new("errors.rs"), &error_syntax);
-        assert!(!error_handlers.contains_key("error_only"));
-        assert!(!error_handlers.contains_key("matches_error"));
-    }
-
-    #[test]
-    fn access_token_and_access_log_helpers_are_not_authorization() {
-        let syntax: syn::File = syn::parse_str(
-            "fn token_only() { verify_access_token(); }
-             fn log_only() { check_access_log(); }
-             fn permission() { check_permission(); }
-             fn access() { check_access(); }
-             fn resource_access() { verify_resource_access(); }",
-        )
-        .unwrap();
-        let handlers = collect_authorized_handlers(Path::new("access.rs"), &syntax);
-
-        assert!(!handlers.contains_key("token_only"));
-        assert!(!handlers.contains_key("log_only"));
-        for (handler, mechanism) in [
-            ("permission", "check_permission"),
-            ("access", "check_access"),
-            ("resource_access", "verify_resource_access"),
-        ] {
-            let evidence = &handlers[handler];
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[0].kind, AuthEvidenceKind::PermissionCheck);
-            assert_eq!(evidence[0].mechanism, mechanism);
-            assert_eq!(evidence[0].strength, AuthStrength::Strong);
-        }
-
-        let token_route = Route {
-            method: "GET".into(),
-            path: "/token-only".into(),
-            scope_prefix: String::new(),
-            handler: Some("token_only".into()),
-            handler_path: None,
-            handler_resolution: None,
-            authorization: handlers.get("token_only").cloned().unwrap_or_default(),
-            line: 1,
-            file: PathBuf::from("access.rs"),
-        };
-        assert!(!token_route.is_authorized());
-    }
-
-    #[test]
-    fn helper_names_separate_enforcement_from_lookups_and_authentication() {
-        use AuthEvidenceKind::*;
-        for (name, expected) in [
-            // Plausible enforcement helpers.
-            ("require_admin", Some(RoleCheck)),
-            ("has_role", Some(RoleCheck)),
-            ("check_roles", Some(RoleCheck)),
-            ("is_admin", Some(RoleCheck)),
-            ("check_permission", Some(PermissionCheck)),
-            ("verify_finance_permission", Some(PermissionCheck)),
-            ("verify_resource_access", Some(PermissionCheck)),
-            ("check_resource_owner", Some(OwnershipCheck)),
-            ("is_owned_by", Some(OwnershipCheck)),
-            ("authorize", Some(ManualAuthorizationCheck)),
-            ("authorize_request", Some(ManualAuthorizationCheck)),
-            // Authentication is identity, never authorization.
-            ("require_auth", Some(IdentityExtraction)),
-            ("require_authenticated_user", Some(IdentityExtraction)),
-            // Misleading names: token validation, lookups, logging, and data.
-            ("verify_access_token", None),
-            ("check_username", None),
-            ("ensure_user_exists", None),
-            ("verify_oauth_state", None),
-            ("check_access_log", None),
-            ("ensure_admin_exists", None),
-            ("check_admin_token", None),
-            ("role_name", None),
-            ("permissions_list", None),
-            ("authorized_user", None),
-            ("downstream", None),
-            ("author_name", None),
-            ("handle_auth_error", None),
-        ] {
-            assert_eq!(
-                classify_check_name(name).map(|(kind, _)| kind),
-                expected,
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn method_calls_use_word_rules_instead_of_substrings() {
-        let syntax: syn::File = syn::parse_str(
-            "fn is_admin_method(user: User) { user.is_admin(); }
-             fn has_role_method(user: User) { user.has_role(\"admin\"); }
-             fn owns_method(user: User) { user.owns(&doc); }
-             fn authorize_method(policy: Policy) { policy.authorize(&user); }
-             fn claims_method(req: Req) { req.extract_claims(); }
-             fn misleading_methods(user: User, stream: Stream, req: Req) {
-                 user.role_name();
-                 user.permissions_list();
-                 req.authorized_user();
-                 stream.downstream();
-             }",
-        )
-        .unwrap();
-        let handlers = collect_authorized_handlers(Path::new("methods.rs"), &syntax);
-
-        for (handler, kind) in [
-            ("is_admin_method", AuthEvidenceKind::RoleCheck),
-            ("has_role_method", AuthEvidenceKind::RoleCheck),
-            ("owns_method", AuthEvidenceKind::OwnershipCheck),
-            (
-                "authorize_method",
-                AuthEvidenceKind::ManualAuthorizationCheck,
-            ),
-            ("claims_method", AuthEvidenceKind::IdentityExtraction),
-        ] {
-            let evidence = &handlers[handler];
-            assert_eq!(evidence.len(), 1, "{handler}");
-            assert_eq!(evidence[0].kind, kind, "{handler}");
-        }
-        assert!(!handlers["claims_method"][0].is_authorization());
-        assert!(!handlers.contains_key("misleading_methods"));
-    }
-
-    #[test]
-    fn route_configuration_names_separate_authorization_from_authentication() {
-        assert_eq!(
-            camel_case_words("AdminAuthMiddleware"),
-            ["admin", "auth", "middleware"]
-        );
-        assert_eq!(camel_case_words("JWTGuard"), ["jwt", "guard"]);
-        assert_eq!(
-            camel_case_words("HttpAuthentication"),
-            ["http", "authentication"]
-        );
-
-        let evidence = |route: &str| {
-            let call: ExprMethodCall = syn::parse_str(route).unwrap();
-            classify_authorization(&call, None, &[], Path::new("fixture.rs"))
-                .into_iter()
-                .map(|item| (item.kind, item.mechanism, item.strength))
-                .collect::<Vec<_>>()
-        };
-        use AuthEvidenceKind::*;
-        use AuthStrength::*;
-        for (route, expected) in [
-            (
-                r#"web::scope("/a").route("/x", web::get().guard(AdminGuard).to(h))"#,
-                vec![(AuthorizationGuard, "AdminGuard", Strong)],
-            ),
-            (
-                r#"web::scope("/a").route("/x", web::get().guard(guard::fn_guard(check_admin)).to(h))"#,
-                vec![(AuthorizationGuard, "check_admin", Strong)],
-            ),
-            (
-                r#"web::scope("/a").wrap(RequireAdmin).route("/x", web::get().to(h))"#,
-                vec![(AuthorizationMiddleware, "RequireAdmin", Medium)],
-            ),
-            (
-                r#"web::scope("/a").wrap(AdminAuthMiddleware).route("/x", web::get().to(h))"#,
-                vec![(AuthorizationMiddleware, "AdminAuthMiddleware", Medium)],
-            ),
-            (
-                r#"web::scope("/a").wrap(AuthMiddleware).route("/x", web::get().to(h))"#,
-                vec![(IdentityExtraction, "AuthMiddleware", Weak)],
-            ),
-            (
-                r#"web::scope("/a").route("/x", web::get().guard(AuthGuard).to(h))"#,
-                vec![(IdentityExtraction, "AuthGuard", Weak)],
-            ),
-            (
-                r#"web::scope("/a").wrap(HttpAuthentication::bearer(validator)).route("/x", web::get().to(h))"#,
-                vec![(IdentityExtraction, "HttpAuthentication", Weak)],
-            ),
-            (
-                r#"web::scope("/a").wrap(UnauthorizedHandler).route("/x", web::get().to(h))"#,
-                vec![],
-            ),
-            (
-                r#"web::scope("/a").wrap(PermissionsPolicy::default()).route("/x", web::get().to(h))"#,
-                vec![],
-            ),
-            (
-                r#"web::scope("/a").wrap(RoleLogger).route("/x", web::get().to(h))"#,
-                vec![],
-            ),
-            // Authorization and guard words, but an error-mapping or logging type.
-            (
-                r#"web::scope("/a").wrap(AuthorizationErrorMiddleware).route("/x", web::get().to(h))"#,
-                vec![],
-            ),
-            (
-                r#"web::scope("/a").wrap(RoleCheckLogger).route("/x", web::get().to(h))"#,
-                vec![],
-            ),
-            (
-                r#"web::scope("/a").route("/x", web::get().guard(guard::Header("x-role", "admin")).to(h))"#,
-                vec![],
-            ),
-        ] {
-            let expected: Vec<_> = expected
-                .into_iter()
-                .map(|(kind, mechanism, strength)| (kind, mechanism.to_owned(), strength))
-                .collect();
-            assert_eq!(evidence(route), expected, "{route}");
-        }
-    }
-
-    #[test]
-    fn guard_and_middleware_evidence_keeps_handler_evidence() {
-        let syntax: syn::File = syn::parse_str(
-            r#"
-            fn require_admin() {}
-            async fn guarded() { check_permission(); }
-            async fn authenticated_admin() { require_admin(); }
-            async fn authenticated_only() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.route("/guarded", web::get().guard(AdminGuard).to(guarded));
-                cfg.service(web::scope("/session")
-                    .wrap(AuthMiddleware)
-                    .route("/admin", web::get().to(authenticated_admin)));
-                cfg.service(web::scope("/session")
-                    .wrap(AuthMiddleware)
-                    .route("/plain", web::get().to(authenticated_only)));
-            }
-            "#,
-        )
-        .unwrap();
-        let file = Path::new("mixed.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let kinds = |path: &str| {
-            let route = visitor
-                .routes
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap();
-            (
-                route.is_authorized(),
-                route
-                    .authorization
-                    .iter()
-                    .map(|item| item.kind.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        use AuthEvidenceKind::*;
-
-        assert_eq!(
-            kinds("/guarded"),
-            (true, vec![AuthorizationGuard, PermissionCheck])
-        );
-        assert_eq!(
-            kinds("/session/admin"),
-            (true, vec![IdentityExtraction, RoleCheck])
-        );
-        assert_eq!(kinds("/session/plain"), (false, vec![IdentityExtraction]));
-    }
-
-    fn route_evidence(source: &str) -> HashMap<String, Vec<(AuthEvidenceKind, String)>> {
-        let syntax: syn::File = syn::parse_str(source).unwrap();
-        let file = Path::new("scopes.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        visitor
-            .routes
-            .into_iter()
-            .map(|route| {
-                let evidence = route
-                    .authorization
-                    .into_iter()
-                    .map(|item| (item.kind, item.mechanism))
-                    .collect();
-                (route.path, evidence)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn scope_middleware_applies_to_every_route_in_its_chain() {
-        // Actix applies a scope's `.wrap(...)` to all of the scope's routes,
-        // wherever the call appears in the builder chain.
-        let evidence = route_evidence(
-            r#"
-            async fn h() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/before").wrap(AdminMiddleware)
-                    .route("/a", web::get().to(h))
-                    .route("/b", web::get().to(h)));
-                cfg.service(web::scope("/between")
-                    .route("/a", web::get().to(h))
-                    .wrap(AdminMiddleware)
-                    .route("/b", web::get().to(h)));
-                cfg.service(web::scope("/after")
-                    .route("/a", web::get().to(h))
-                    .route("/b", web::get().to(h))
-                    .wrap(AdminMiddleware));
-                cfg.service(web::scope("/leak")
-                    .route("/a", web::get().guard(AdminGuard).to(h))
-                    .wrap(Logger::default())
-                    .route("/b", web::get().to(h)));
-            }
-            "#,
-        );
-        let middleware = vec![(
-            AuthEvidenceKind::AuthorizationMiddleware,
-            "AdminMiddleware".to_owned(),
-        )];
-        for scope in ["/before", "/between", "/after"] {
-            for route in ["a", "b"] {
-                let path = format!("{scope}/{route}");
-                assert_eq!(evidence[&path], middleware, "{path}");
-            }
-        }
-        // A sibling route's own guard is not scope configuration.
-        assert_eq!(
-            evidence["/leak/a"],
-            vec![(
-                AuthEvidenceKind::AuthorizationGuard,
-                "AdminGuard".to_owned()
-            )]
-        );
-        assert!(evidence["/leak/b"].is_empty());
-    }
-
-    #[test]
-    fn nested_scopes_inherit_middleware_without_leaking_to_siblings() {
-        let evidence = route_evidence(
-            r#"
-            async fn h() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/api").wrap(AuthMiddleware)
-                    .service(web::scope("/admin").wrap(AdminMiddleware)
-                        .route("/x", web::get().to(h))
-                        .service(web::scope("/deep").guard(RoleGuard)
-                            .route("/z", web::get().to(h))))
-                    .service(web::scope("/public")
-                        .route("/y", web::get().to(h)))
-                    .route("/direct", web::get().to(h)));
-                cfg.service(web::scope("/other").route("/w", web::get().to(h)));
-            }
-            "#,
-        );
-        use AuthEvidenceKind::*;
-        let kinds = |path: &str| {
-            let mut found: Vec<(AuthEvidenceKind, &str)> = evidence[path]
-                .iter()
-                .map(|(kind, mechanism)| (kind.clone(), mechanism.as_str()))
-                .collect();
-            found.sort_by_key(|(_, mechanism)| mechanism.to_owned());
-            found
-        };
-
-        assert_eq!(
-            kinds("/api/admin/x"),
-            vec![
-                (AuthorizationMiddleware, "AdminMiddleware"),
-                (IdentityExtraction, "AuthMiddleware"),
-            ]
-        );
-        assert_eq!(
-            kinds("/api/admin/deep/z"),
-            vec![
-                (AuthorizationMiddleware, "AdminMiddleware"),
-                (IdentityExtraction, "AuthMiddleware"),
-                (AuthorizationGuard, "RoleGuard"),
-            ]
-        );
-        // Siblings receive the shared parent's middleware but not each other's.
-        assert_eq!(
-            kinds("/api/public/y"),
-            vec![(IdentityExtraction, "AuthMiddleware")]
-        );
-        assert_eq!(
-            kinds("/api/direct"),
-            vec![(IdentityExtraction, "AuthMiddleware")]
-        );
-        // An unrelated top-level scope receives nothing.
-        assert!(evidence["/other/w"].is_empty());
-    }
-
-    #[test]
-    fn scope_middleware_is_kept_alongside_handler_evidence() {
-        let source = r#"
-            fn require_admin() {}
-            async fn users() { require_admin(); }
-            async fn orders() { require_admin(); }
-            async fn payments() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/admin").wrap(AdminMiddleware)
-                    .route("/users", web::get().to(users))
-                    .route("/orders", web::get().to(orders))
-                    .route("/payments", web::get().to(payments)));
-            }
-        "#;
-        let evidence = route_evidence(source);
-        use AuthEvidenceKind::*;
-        for path in ["/admin/users", "/admin/orders"] {
-            assert_eq!(
-                evidence[path],
-                vec![
-                    (AuthorizationMiddleware, "AdminMiddleware".to_owned()),
-                    (RoleCheck, "require_admin".to_owned()),
-                ],
-                "{path}"
-            );
-        }
-        assert_eq!(
-            evidence["/admin/payments"],
-            vec![(AuthorizationMiddleware, "AdminMiddleware".to_owned())]
-        );
-
-        // Every route is authorized by the scope middleware, so no drift remains.
-        let syntax: syn::File = syn::parse_str(source).unwrap();
-        let file = Path::new("scopes.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let (_, _, details, _) = build_analysis_layers(&visitor.routes);
-        assert!(details.is_empty());
-    }
-
-    #[test]
-    fn route_and_handler_names_alone_do_not_count_as_protection() {
-        let syntax: syn::File = syn::parse_str(
-            r#"
-            async fn require_admin_panel() {}
-            async fn admin_only() {}
-            #[get("/admin/attribute")]
-            async fn check_permission() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/admin")
-                    .route("/panel", web::get().to(require_admin_panel))
-                    .route("/secure", web::get().to(admin_only)));
-            }
-            "#,
-        )
-        .unwrap();
-        let file = Path::new("names.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-
-        assert_eq!(visitor.routes.len(), 3);
-        for route in &visitor.routes {
-            assert!(route.authorization.is_empty(), "{}", route.path);
-            assert!(!route.is_authorized(), "{}", route.path);
-        }
-    }
-
-    #[test]
-    fn identity_extraction_is_not_authorization() {
-        let syntax: syn::File =
-            syn::parse_str("fn profile() { let claims = Claims::from_request(); }").unwrap();
-        let handlers = collect_authorized_handlers(Path::new("identity.rs"), &syntax);
-        let evidence = &handlers["profile"][0];
-        assert_eq!(evidence.kind, AuthEvidenceKind::IdentityExtraction);
-
-        let route = Route {
-            method: "GET".into(),
-            path: "/profile".into(),
-            scope_prefix: String::new(),
-            handler: Some("profile".into()),
-            handler_path: None,
-            handler_resolution: None,
-            authorization: handlers["profile"].clone(),
-            line: 1,
-            file: PathBuf::from("identity.rs"),
-        };
-        assert!(!route.is_authorized());
-        assert!(route.strongest_evidence().is_none());
-    }
-
-    #[test]
-    fn logger_and_compress_are_not_authorization_middleware() {
-        for middleware in ["Logger", "Compress"] {
-            let route: ExprMethodCall = syn::parse_str(&format!(
-                "web::scope(\"/admin\").route(\"/x\", web::get().wrap({middleware}))"
-            ))
-            .unwrap();
-            assert!(classify_authorization(&route, None, &[], Path::new("fixture.rs")).is_empty());
-        }
-    }
-
-    #[test]
-    fn empty_route_has_no_authorization_evidence() {
-        let route = route("GET", "/admin/payments", "/admin", "NONE");
-        assert!(route.authorization.is_empty());
-        assert!(!route.is_authorized());
-        assert_eq!(
-            route.evidence_summary(),
-            "No recognized authorization evidence"
-        );
-    }
-
-    #[test]
-    fn nested_handlers_resolve_in_their_lexical_block_only() {
-        let syntax: syn::File = syn::parse_str(
-            "fn require_admin() {}
-async fn health() { require_admin(); }
-fn configure_admin(cfg: &mut web::ServiceConfig) {
-    async fn list() { require_admin(); }
-    cfg.route(\"/admin/list\", web::get().to(list));
-    cfg.route(\"/admin/late\", web::get().to(late));
-    async fn late() { require_admin(); }
-}
-fn configure_public(cfg: &mut web::ServiceConfig) {
-    async fn list() {}
-    async fn health() {}
-    cfg.route(\"/public/list\", web::get().to(list));
-    cfg.route(\"/public/health\", web::get().to(health));
-    cfg.route(\"/public/module-health\", web::get().to(self::health));
-    App::new().route(\"/public/closure\", web::get().to(list));
-    {
-        async fn list() { require_admin(); }
-        cfg.route(\"/public/inner-block\", web::get().to(list));
-    }
-}
-fn configure_duplicate(cfg: &mut web::ServiceConfig) {
-    async fn health() {}
-    async fn health() { require_admin(); }
-    cfg.route(\"/duplicate/health\", web::get().to(health));
-}
-fn configure_top(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/top/health\", web::get().to(health));
-    cfg.route(\"/top/late\", web::get().to(late));
-}",
-        )
-        .unwrap();
-        let file = Path::new("nested.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let route = |path: &str| {
-            visitor
-                .routes
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("missing route {path}"))
-        };
-
-        // Protected nested handlers, including one declared after its route,
-        // and an inner block's `list` shadowing its enclosing block's `list`.
-        for (path, line) in [
-            ("/admin/list", 4),
-            ("/admin/late", 7),
-            ("/public/inner-block", 17),
-        ] {
-            let route = route(path);
-            assert_eq!(
-                route.handler_resolution,
-                Some(HandlerResolution::Local),
-                "{path}"
-            );
-            assert_eq!(route.authorization.len(), 1, "{path}");
-            assert_eq!(route.authorization[0].line, line, "{path}");
-        }
-
-        // A sibling's nested `list`, and a nested `health` that shadows the
-        // protected module-level `health`, lend no evidence; closures inside
-        // the block see the block's own `list`.
-        for path in ["/public/list", "/public/health", "/public/closure"] {
-            assert_eq!(
-                route(path).handler_resolution,
-                Some(HandlerResolution::Local),
-                "{path}"
-            );
-            assert!(route(path).authorization.is_empty(), "{path}");
-        }
-
-        // Qualified paths bypass block scopes and reach the module-level definition.
-        let module_health = route("/public/module-health");
-        assert_eq!(
-            module_health.handler_resolution,
-            Some(HandlerResolution::Qualified)
-        );
-        assert_eq!(module_health.authorization[0].line, 2);
-
-        // A duplicate declaration fails safely instead of borrowing either
-        // candidate or the module-level `health`.
-        let duplicate = route("/duplicate/health");
-        assert_eq!(
-            duplicate.handler_resolution,
-            Some(HandlerResolution::Unresolved)
-        );
-        assert!(duplicate.authorization.is_empty());
-
-        // Outside those blocks, `health` is the module-level definition, and
-        // another function's nested `late` is not reachable even by fallback.
-        let top_health = route("/top/health");
-        assert_eq!(
-            top_health.handler_resolution,
-            Some(HandlerResolution::Local)
-        );
-        assert_eq!(top_health.authorization[0].line, 2);
-        let top_late = route("/top/late");
-        assert_eq!(
-            top_late.handler_resolution,
-            Some(HandlerResolution::Unresolved)
-        );
-        assert!(top_late.authorization.is_empty());
-    }
-
-    #[test]
-    fn nested_function_bodies_do_not_lend_evidence_to_the_enclosing_handler() {
-        let syntax: syn::File = syn::parse_str(
-            "fn require_admin() {}
-async fn report() {
-    fn report_helper() { require_admin(); }
-}
-async fn audited() {
-    require_admin();
-    fn audited_helper() { check_permission(); }
-}
-async fn with_methods() {
-    struct Helper;
-    impl Helper { fn check(&self) { require_admin(); } }
-    trait Guarded { fn guarded(&self) { require_admin(); } }
-}
-async fn branchy(flag: bool) {
-    if flag { let _ = { require_admin(); }; }
-    let check = || require_admin();
-    check();
-}
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/report\", web::get().to(report))
-        .route(\"/audited\", web::get().to(audited))
-        .route(\"/with-methods\", web::get().to(with_methods))
-        .route(\"/branchy\", web::get().to(branchy));
-}",
-        )
-        .unwrap();
-        let file = Path::new("nested-evidence.rs");
-        let handlers = collect_authorized_handlers(file, &syntax);
-
-        // An uncalled nested helper, or nested impl/trait methods, lend nothing.
-        assert!(!handlers.contains_key("report"));
-        assert!(!handlers.contains_key("with_methods"));
-        // The nested helper still owns its evidence.
-        let helper = &handlers["report_helper"];
-        assert_eq!(helper.len(), 1);
-        assert_eq!(helper[0].line, 3);
-        assert_eq!(helper[0].handler.as_deref(), Some("report_helper"));
-        // Positive control: the outer handler's direct call is still recognized,
-        // without the nested helper's permission check.
-        let audited = &handlers["audited"];
-        assert_eq!(audited.len(), 1);
-        assert_eq!(audited[0].kind, AuthEvidenceKind::RoleCheck);
-        assert_eq!(audited[0].mechanism, "require_admin");
-        assert_eq!(audited[0].line, 6);
-        // Nested blocks, branches, and closures in the handler are still traversed.
-        let branchy_lines: Vec<usize> = handlers["branchy"].iter().map(|item| item.line).collect();
-        assert_eq!(branchy_lines, vec![15, 16]);
-
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let route = |path: &str| {
-            visitor
-                .routes
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("missing route {path}"))
-        };
-        for path in ["/report", "/with-methods"] {
-            assert!(route(path).authorization.is_empty(), "{path}");
-            assert!(!route(path).is_authorized(), "{path}");
-        }
-        assert_eq!(route("/audited").authorization.len(), 1);
-        assert!(route("/audited").is_authorized());
-        assert_eq!(route("/branchy").authorization.len(), 2);
-    }
-
-    #[test]
-    fn inline_modules_do_not_see_enclosing_block_handlers() {
-        // `list` is not in scope inside `mod inner` (rustc rejects it); the
-        // analyzer must fail safely rather than borrow the block's evidence.
-        let syntax: syn::File = syn::parse_str(
-            "fn require_admin() {}
-fn configure(cfg: &mut web::ServiceConfig) {
-    async fn list() { require_admin(); }
-    mod inner {
-        fn configure(cfg: &mut web::ServiceConfig) {
-            async fn own() { require_admin(); }
-            cfg.route(\"/inner/list\", web::get().to(list));
-            cfg.route(\"/inner/own\", web::get().to(own));
-        }
-    }
-    cfg.route(\"/outer/list\", web::get().to(list));
-}",
-        )
-        .unwrap();
-        let file = Path::new("inline-module.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let route = |path: &str| {
-            visitor
-                .routes
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("missing route {path}"))
-        };
-
-        let inner_list = route("/inner/list");
-        assert_eq!(
-            inner_list.handler_resolution,
-            Some(HandlerResolution::Unresolved)
-        );
-        assert!(inner_list.authorization.is_empty());
-
-        // The module's own blocks still resolve, and the enclosing block's
-        // scope is restored after the module.
-        for (path, line) in [("/inner/own", 6), ("/outer/list", 3)] {
-            let route = route(path);
-            assert_eq!(
-                route.handler_resolution,
-                Some(HandlerResolution::Local),
-                "{path}"
-            );
-            assert_eq!(route.authorization.len(), 1, "{path}");
-            assert_eq!(route.authorization[0].line, line, "{path}");
-        }
-    }
-
-    #[test]
-    fn local_bindings_shadow_handler_names_in_lexical_order() {
-        let source = "fn require_admin() {}
-async fn health() { require_admin(); }
-async fn public_health() {}
-struct Wrapper<T> { inner: T }
-struct Routes;
-impl Routes {
-    fn register(cfg: &mut web::ServiceConfig, health: u8) {
-        cfg.route(\"/method-param\", web::get().to(health));
-    }
-}
-fn register<H>(cfg: &mut web::ServiceConfig, health: H) {
-    cfg.route(\"/param\", web::get().to(health));
-}
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/unshadowed\", web::get().to(health));
-    {
-        let health = || async {};
-        cfg.route(\"/closure\", web::get().to(health));
-    }
-    {
-        let health = public_health;
-        cfg.route(\"/variable\", web::get().to(health));
-    }
-    {
-        cfg.route(\"/before-let\", web::get().to(health));
-        let health = {
-            cfg.route(\"/own-initializer\", web::get().to(health));
-            public_health
-        };
-        cfg.route(\"/after-let\", web::get().to(health));
-        cfg.route(\"/qualified\", web::get().to(self::health));
-        cfg.route(\"/crate-qualified\", web::get().to(crate::health));
-    }
-    {
-        let (health, _) = (public_health, 1);
-        cfg.route(\"/destructured\", web::get().to(health));
-    }
-    {
-        let Wrapper { inner: health } = Wrapper { inner: public_health };
-        cfg.route(\"/struct-pattern\", web::get().to(health));
-    }
-    for health in [public_health] {
-        cfg.route(\"/for\", web::get().to(health));
-    }
-    cfg.route(\"/after-for\", web::get().to(health));
-    match Some(public_health) {
-        Some(health) if true => { cfg.route(\"/match\", web::get().to(health)); }
-        _ => { cfg.route(\"/other-arm\", web::get().to(health)); }
-    }
-    cfg.route(\"/after-match\", web::get().to(health));
-    if let Some(health) = Some(public_health) {
-        cfg.route(\"/if-let\", web::get().to(health));
-    } else {
-        cfg.route(\"/if-let-else\", web::get().to(health));
-    }
-    cfg.route(\"/after-if\", web::get().to(health));
-    while let Some(health) = None::<fn()> {
-        cfg.route(\"/while-let\", web::get().to(health));
-    }
-    cfg.route(\"/after-while\", web::get().to(health));
-    if let Some(health) = Some(cfg.route(\"/first-scrutinee\", web::get().to(health)))
-        && let Some(_) = Some(cfg.route(\"/chain-scrutinee\", web::get().to(health)))
-    {
-        cfg.route(\"/let-chain\", web::get().to(health));
-    }
-    [public_health].into_iter().for_each(|health| {
-        cfg.route(\"/closure-param\", web::get().to(health));
-    });
-    cfg.route(\"/after-closure\", web::get().to(health));
-    {
-        const health: u8 = 5;
-        cfg.route(\"/const\", web::get().to(health));
-    }
-    {
-        static health: u8 = 5;
-        cfg.route(\"/static\", web::get().to(health));
-    }
-    {
-        async fn health() { require_admin(); }
-        let health = public_health;
-        cfg.route(\"/let-over-item\", web::get().to(health));
-    }
-    let health = public_health;
-    let mut later = || cfg.route(\"/captured\", web::get().to(health));
-    {
-        async fn health() { require_admin(); }
-        cfg.route(\"/inner-item\", web::get().to(health));
-    }
-    cfg.route(\"/outer-let\", web::get().to(health));
-}";
-        let syntax: syn::File = syn::parse_str(source).unwrap();
-        let line_of = |needle: &str| {
-            source
-                .lines()
-                .position(|line| line.contains(needle))
-                .map(|index| index + 1)
-                .unwrap()
-        };
-        let module_health = line_of("async fn health() { require_admin(); }");
-        let inner_item = source
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains("async fn health() { require_admin(); }"))
-            .map(|(index, _)| index + 1)
-            .last()
-            .unwrap();
-        assert!(inner_item > module_health);
-        assert!(inner_item < line_of("\"/inner-item\""));
-
-        let file = Path::new("shadowing.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let route = |path: &str| {
-            visitor
-                .routes
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("missing route {path}"))
-        };
-
-        // Every binding form shadows the protected module-level `health`.
-        for path in [
-            "/method-param",
-            "/param",
-            "/closure",
-            "/variable",
-            "/after-let",
-            "/destructured",
-            "/struct-pattern",
-            "/for",
-            "/match",
-            "/if-let",
-            "/while-let",
-            "/chain-scrutinee",
-            "/let-chain",
-            "/closure-param",
-            "/const",
-            "/static",
-            "/let-over-item",
-            "/captured",
-            "/outer-let",
-        ] {
-            let route = route(path);
-            assert_eq!(
-                route.handler_resolution,
-                Some(HandlerResolution::Unresolved),
-                "{path}"
-            );
-            assert!(route.authorization.is_empty(), "{path}");
-            assert!(!route.is_authorized(), "{path}");
-        }
-
-        // Before a binding, inside its own initializer, in sibling branches, and
-        // after its scope ends, `health` is still the module-level handler.
-        for path in [
-            "/unshadowed",
-            "/before-let",
-            "/own-initializer",
-            "/after-for",
-            "/other-arm",
-            "/after-match",
-            "/if-let-else",
-            "/after-if",
-            "/after-while",
-            "/first-scrutinee",
-            "/after-closure",
-        ] {
-            let route = route(path);
-            assert_eq!(
-                route.handler_resolution,
-                Some(HandlerResolution::Local),
-                "{path}"
-            );
-            assert_eq!(route.authorization.len(), 1, "{path}");
-            assert_eq!(route.authorization[0].line, module_health, "{path}");
-        }
-
-        // Qualified paths bypass local bindings.
-        for path in ["/qualified", "/crate-qualified"] {
-            let route = route(path);
-            assert_eq!(
-                route.handler_resolution,
-                Some(HandlerResolution::Qualified),
-                "{path}"
-            );
-            assert_eq!(route.authorization[0].line, module_health, "{path}");
-        }
-
-        // An inner block's item shadows the outer `let`.
-        let inner = route("/inner-item");
-        assert_eq!(inner.handler_resolution, Some(HandlerResolution::Local));
-        assert_eq!(inner.authorization.len(), 1);
-        assert_eq!(inner.authorization[0].line, inner_item);
-    }
-
-    #[test]
-    fn shadowed_handler_names_never_use_the_unique_name_fallback() {
-        let repo = TempRepo::new(
-            "shadowed-fallback",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                (
-                    "src/handlers.rs",
-                    "fn require_admin() {}
-pub async fn health() { require_admin(); }
-",
-                ),
-                (
-                    "src/main.rs",
-                    "mod handlers;
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/fallback\", web::get().to(health));
-    let health = || async {};
-    cfg.route(\"/closure\", web::get().to(health));
-    cfg.route(\"/qualified\", web::get().to(handlers::health));
-}
-fn register<H>(cfg: &mut web::ServiceConfig, health: H) {
-    cfg.route(\"/param\", web::get().to(health));
-}
-fn configure_loop(cfg: &mut web::ServiceConfig) {
-    for health in [handlers::health] {
-        cfg.route(\"/for\", web::get().to(health));
-    }
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        assert_resolved_evidence(
-            route_at(&report, "/fallback"),
-            HandlerResolution::UniqueName,
-            "src/handlers.rs",
-        );
-        assert_resolved_evidence(
-            route_at(&report, "/qualified"),
-            HandlerResolution::Qualified,
-            "src/handlers.rs",
-        );
-        for path in ["/closure", "/param", "/for"] {
-            let route = route_at(&report, path);
-            assert_eq!(resolution(route), &HandlerResolution::Unresolved, "{path}");
-            assert!(route.authorization.is_empty(), "{path}");
-        }
-    }
-
-    struct TempRepo(PathBuf);
-
-    impl TempRepo {
-        fn new(name: &str, files: &[(&str, &str)]) -> Self {
-            let root = std::env::temp_dir().join(format!("archer-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            for (path, contents) in files {
-                let path = root.join(path);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, contents).unwrap();
-            }
-            Self(root)
-        }
-
-        fn analyze(&self) -> Report {
-            analyze_repository(&self.0).unwrap()
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    const CARGO_TOML: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n";
-
-    fn route_at<'a>(report: &'a Report, path: &str) -> &'a Route {
-        report
-            .routes
-            .iter()
-            .find(|route| route.path == path)
-            .unwrap_or_else(|| panic!("missing route {path}"))
-    }
-
-    fn resolution(route: &Route) -> &HandlerResolution {
-        route.handler_resolution.as_ref().unwrap()
-    }
-
-    fn assert_resolved_evidence(route: &Route, expected: HandlerResolution, file_suffix: &str) {
-        assert_eq!(
-            resolution(route),
-            &expected,
-            "resolution for {}",
-            route.path
-        );
-        assert_eq!(route.authorization.len(), 1, "evidence for {}", route.path);
-        assert_eq!(route.authorization[0].mechanism, "require_admin");
-        assert!(
-            route.authorization[0].file.ends_with(file_suffix),
-            "evidence for {} came from {}",
-            route.path,
-            route.authorization[0].file.display()
-        );
-        assert!(route.is_authorized());
-    }
-
-    #[test]
-    fn cross_file_glob_imported_handlers_carry_definition_evidence() {
-        let repo = TempRepo::new(
-            "cross-file",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                (
-                    "src/handlers.rs",
-                    "pub fn require_admin() {}
-pub async fn users() { require_admin(); }
-pub async fn orders() { require_admin(); }
-pub async fn reports() { require_admin(); }
-pub async fn payments() {}
-",
-                ),
-                (
-                    "src/main.rs",
-                    "mod handlers;
-use crate::handlers::*;
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(web::scope(\"/admin\")
-        .route(\"/users\", web::get().to(users))
-        .route(\"/orders\", web::get().to(orders))
-        .route(\"/reports\", web::get().to(reports))
-        .route(\"/payments\", web::get().to(payments)));
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        assert_eq!(report.routes.len(), 4);
-        for path in ["/admin/users", "/admin/orders", "/admin/reports"] {
-            let route = route_at(&report, path);
-            assert_resolved_evidence(route, HandlerResolution::GlobImported, "src/handlers.rs");
-            assert!(route.file.ends_with("src/main.rs"));
-        }
-        let users = route_at(&report, "/admin/users");
-        assert_eq!(users.authorization[0].line, 2);
-        assert_eq!(users.authorization[0].handler.as_deref(), Some("users"));
-
-        let payments = route_at(&report, "/admin/payments");
-        assert_eq!(resolution(payments), &HandlerResolution::GlobImported);
-        assert!(payments.authorization.is_empty());
-
-        assert_eq!(report.finding_details.len(), 1);
-        assert_eq!(
-            report.finding_details[0].suspicious_route.path,
-            "/admin/payments"
-        );
-        assert_eq!(report.finding_details[0].authorized_peer_routes.len(), 3);
-    }
-
-    #[test]
-    fn module_qualified_handlers_resolve_through_file_and_inline_modules() {
-        let repo = TempRepo::new(
-            "qualified",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                ("src/handlers/mod.rs", "pub mod admin;\n"),
-                (
-                    "src/handlers/admin.rs",
-                    "fn require_admin() {}
-pub async fn users() { require_admin(); }
-pub async fn orders() { require_admin(); }
-",
-                ),
-                (
-                    "src/main.rs",
-                    "mod handlers;
-mod routes;
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/root-relative\", web::get().to(handlers::admin::users));
-}
-",
-                ),
-                (
-                    "src/routes.rs",
-                    "use crate::handlers::admin;
-async fn health() {}
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/crate\", web::get().to(crate::handlers::admin::users))
-        .route(\"/super\", web::get().to(super::handlers::admin::orders))
-        .route(\"/module-alias\", web::get().to(admin::orders))
-        .route(\"/self\", web::get().to(self::health));
-}
-mod nested {
-    fn configure(cfg: &mut web::ServiceConfig) {
-        cfg.route(\"/nested-super\", web::get().to(super::super::handlers::admin::users));
-    }
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        for path in [
-            "/root-relative",
-            "/crate",
-            "/super",
-            "/module-alias",
-            "/nested-super",
-        ] {
-            assert_resolved_evidence(
-                route_at(&report, path),
-                HandlerResolution::Qualified,
-                "src/handlers/admin.rs",
-            );
-        }
-        let crate_route = route_at(&report, "/crate");
-        assert_eq!(crate_route.handler.as_deref(), Some("users"));
-        assert_eq!(
-            crate_route.handler_path.as_deref(),
-            Some("crate::handlers::admin::users")
-        );
-
-        let health = route_at(&report, "/self");
-        assert_eq!(resolution(health), &HandlerResolution::Qualified);
-        assert!(health.authorization.is_empty());
-    }
-
-    #[test]
-    fn explicit_imports_renames_and_reexports_resolve_to_the_named_definition() {
-        let repo = TempRepo::new(
-            "imports",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                (
-                    "src/handlers/mod.rs",
-                    "pub mod admin;
-pub mod public;
-pub use public::list as public_list;
-",
-                ),
-                (
-                    "src/handlers/admin.rs",
-                    "fn require_admin() {}
-pub async fn list() { require_admin(); }
-",
-                ),
-                ("src/handlers/public.rs", "pub async fn list() {}\n"),
-                (
-                    "src/main.rs",
-                    "mod handlers;
-use crate::handlers::admin::list as admin_list;
-use crate::handlers::public::{self, list};
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/renamed\", web::get().to(admin_list))
-        .route(\"/grouped\", web::get().to(list))
-        .route(\"/self-import\", web::get().to(public::list))
-        .route(\"/reexport\", web::get().to(handlers::public_list));
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        let renamed = route_at(&report, "/renamed");
-        assert_resolved_evidence(
-            renamed,
-            HandlerResolution::Imported,
-            "src/handlers/admin.rs",
-        );
-        assert_eq!(renamed.handler.as_deref(), Some("admin_list"));
-        assert_eq!(renamed.authorization[0].handler.as_deref(), Some("list"));
-
-        let grouped = route_at(&report, "/grouped");
-        assert_eq!(resolution(grouped), &HandlerResolution::Imported);
-        assert!(grouped.authorization.is_empty());
-
-        for path in ["/self-import", "/reexport"] {
-            let route = route_at(&report, path);
-            assert_eq!(resolution(route), &HandlerResolution::Qualified, "{path}");
-            assert!(route.authorization.is_empty(), "{path}");
-        }
-    }
-
-    #[test]
-    fn duplicate_handler_names_never_share_evidence() {
-        let repo = TempRepo::new(
-            "duplicates",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                ("src/handlers/mod.rs", "pub mod admin;\npub mod public;\n"),
-                (
-                    "src/handlers/admin.rs",
-                    "fn require_admin() {}
-pub async fn list() { require_admin(); }
-",
-                ),
-                ("src/handlers/public.rs", "pub async fn list() {}\n"),
-                (
-                    "src/main.rs",
-                    "mod handlers;
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/admin/list\", web::get().to(handlers::admin::list))
-        .route(\"/public/list\", web::get().to(handlers::public::list));
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        assert_resolved_evidence(
-            route_at(&report, "/admin/list"),
-            HandlerResolution::Qualified,
-            "src/handlers/admin.rs",
-        );
-        let public = route_at(&report, "/public/list");
-        assert_eq!(resolution(public), &HandlerResolution::Qualified);
-        assert!(public.authorization.is_empty());
-        assert!(!public.is_authorized());
-    }
-
-    #[test]
-    fn same_file_inline_modules_with_duplicate_names_do_not_create_false_drift() {
-        let repo = TempRepo::new(
-            "inline-duplicates",
-            &[(
-                "src/main.rs",
-                "fn require_admin() {}
-mod admin { pub async fn list() { super::require_admin(); } }
-mod public { pub async fn list() {} }
-async fn users() { require_admin(); }
-async fn orders() { require_admin(); }
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(web::scope(\"/admin\")
-        .route(\"/users\", web::get().to(users))
-        .route(\"/orders\", web::get().to(orders))
-        .route(\"/list\", web::get().to(admin::list)));
-    cfg.service(web::scope(\"/public\").route(\"/list\", web::get().to(public::list)));
-}
-",
-            )],
-        );
-        let report = repo.analyze();
-
-        assert_resolved_evidence(
-            route_at(&report, "/admin/list"),
-            HandlerResolution::Qualified,
-            "src/main.rs",
-        );
-        assert_eq!(
-            resolution(route_at(&report, "/admin/users")),
-            &HandlerResolution::Local
-        );
-        assert!(route_at(&report, "/public/list").authorization.is_empty());
-        assert!(report.finding_details.is_empty());
-    }
-
-    #[test]
-    fn ambiguous_handlers_attach_no_evidence_and_list_sorted_candidates() {
-        let repo = TempRepo::new(
-            "ambiguous",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                ("src/handlers/mod.rs", "pub mod admin;\npub mod public;\n"),
-                (
-                    "src/handlers/admin.rs",
-                    "fn require_admin() {}
-pub async fn list() { require_admin(); }
-pub async fn audit() { require_admin(); }
-",
-                ),
-                ("src/handlers/public.rs", "pub async fn list() {}\n"),
-                (
-                    "src/main.rs",
-                    "mod handlers;
-mod routes;
-use crate::handlers::public::*;
-use crate::handlers::admin::*;
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/glob-ambiguous\", web::get().to(list));
-}
-",
-                ),
-                (
-                    "src/routes.rs",
-                    "fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/fallback-ambiguous\", web::get().to(list))
-        .route(\"/unique\", web::get().to(audit))
-        .route(\"/compatible-qualifier\", web::get().to(crate::handlers::audit))
-        .route(\"/incompatible-qualifier\", web::get().to(crate::handlers::public::audit));
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        let expected = HandlerResolution::Ambiguous {
-            candidates: vec![
-                "crate::handlers::admin::list".into(),
-                "crate::handlers::public::list".into(),
-            ],
-        };
-        for path in ["/glob-ambiguous", "/fallback-ambiguous"] {
-            let route = route_at(&report, path);
-            assert_eq!(resolution(route), &expected, "{path}");
-            assert!(route.authorization.is_empty(), "{path}");
-            assert!(!route.is_authorized(), "{path}");
-        }
-
-        for path in ["/unique", "/compatible-qualifier"] {
-            assert_resolved_evidence(
-                route_at(&report, path),
-                HandlerResolution::UniqueName,
-                "src/handlers/admin.rs",
-            );
-        }
-        let incompatible = route_at(&report, "/incompatible-qualifier");
-        assert_eq!(resolution(incompatible), &HandlerResolution::Unresolved);
-        assert!(incompatible.authorization.is_empty());
-
-        let first = serde_json::to_string(&report).unwrap();
-        let second = serde_json::to_string(&repo.analyze()).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn unresolved_handlers_stay_in_inventory_without_evidence() {
-        let repo = TempRepo::new(
-            "unresolved",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                (
-                    "src/other.rs",
-                    "fn require_admin() {}
-pub async fn h() { require_admin(); }
-pub async fn imported() { require_admin(); }
-",
-                ),
-                (
-                    "src/main.rs",
-                    "mod other;
-use other_crate::imported;
-struct Handlers;
-impl Handlers { async fn list() { require_admin(); } }
-async fn list() { require_admin(); }
-fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.route(\"/external\", web::get().to(other_crate::h))
-        .route(\"/absolute\", web::get().to(::other_crate::h))
-        .route(\"/explicit-external-import\", web::get().to(imported))
-        .route(\"/method\", web::get().to(Handlers::list))
-        .route(\"/closure\", web::get().to(|| async { \"ok\" }))
-        .route(\"/missing\", web::get().to(missing_handler))
-        .route(\"/no-handler\", web::get());
-}
-",
-                ),
-            ],
-        );
-        let report = repo.analyze();
-
-        assert_eq!(report.routes.len(), 7);
-        for path in [
-            "/external",
-            "/absolute",
-            "/explicit-external-import",
-            "/method",
-            "/closure",
-            "/missing",
-        ] {
-            let route = route_at(&report, path);
-            assert_eq!(resolution(route), &HandlerResolution::Unresolved, "{path}");
-            assert!(route.authorization.is_empty(), "{path}");
-            assert!(!route.is_authorized(), "{path}");
-        }
-
-        let method = route_at(&report, "/method");
-        assert_eq!(method.handler.as_deref(), Some("list"));
-        assert_eq!(method.handler_path.as_deref(), Some("Handlers::list"));
-        assert_eq!(
-            route_at(&report, "/absolute").handler_path.as_deref(),
-            Some("::other_crate::h")
-        );
-
-        let closure = route_at(&report, "/closure");
-        assert!(closure.handler.is_none());
-        assert!(closure.handler_path.is_none());
-
-        let no_handler = route_at(&report, "/no-handler");
-        assert!(no_handler.handler.is_none());
-        assert!(no_handler.handler_resolution.is_none());
-    }
-
-    #[test]
-    fn attribute_routes_use_their_own_definition_evidence() {
-        let repo = TempRepo::new(
-            "attributes",
-            &[(
-                "src/main.rs",
-                "fn require_admin() {}
-mod admin { pub async fn users() { super::require_admin(); } }
-#[get(\"/users\")]
-async fn users() {}
-mod secure {
-    #[get(\"/secure\")]
-    async fn users() { crate::require_admin(); }
-}
-",
-            )],
-        );
-        let report = repo.analyze();
-
-        let open = route_at(&report, "/users");
-        assert_eq!(resolution(open), &HandlerResolution::Definition);
-        assert!(open.authorization.is_empty());
-
-        let secure = route_at(&report, "/secure");
-        assert_eq!(resolution(secure), &HandlerResolution::Definition);
-        assert_eq!(secure.authorization.len(), 1);
-        assert_eq!(secure.authorization[0].mechanism, "require_admin");
-        assert_eq!(secure.authorization[0].line, 7);
-    }
-
-    #[test]
-    fn handler_resolution_serializes_as_tagged_kind() {
-        assert_eq!(
-            serde_json::to_value(HandlerResolution::Local).unwrap(),
-            serde_json::json!({"kind": "Local"})
-        );
-        assert_eq!(
-            serde_json::to_value(HandlerResolution::Ambiguous {
-                candidates: vec!["crate::a::list".into()]
-            })
-            .unwrap(),
-            serde_json::json!({"kind": "Ambiguous", "candidates": ["crate::a::list"]})
-        );
-    }
-
-    #[test]
-    fn module_location_follows_cargo_layout() {
-        let repo = TempRepo::new(
-            "layout",
-            &[
-                ("Cargo.toml", CARGO_TOML),
-                ("src/main.rs", ""),
-                ("src/lib.rs", ""),
-                ("src/handlers/mod.rs", ""),
-                ("src/handlers/admin.rs", ""),
-                ("src/bin/tool.rs", ""),
-                ("tests/integration.rs", ""),
-                ("build.rs", ""),
-            ],
-        );
-        let root = &repo.0;
-        let module = |path: &str| module_location(root, &root.join(path));
-
-        assert_eq!(module("src/main.rs"), (root.clone(), vec![]));
-        assert_eq!(module("src/lib.rs"), (root.clone(), vec![]));
-        assert_eq!(
-            module("src/handlers/mod.rs"),
-            (root.clone(), vec!["handlers".into()])
-        );
-        assert_eq!(
-            module("src/handlers/admin.rs"),
-            (root.clone(), vec!["handlers".into(), "admin".into()])
-        );
-        for isolated in ["src/bin/tool.rs", "tests/integration.rs", "build.rs"] {
-            assert_eq!(
-                module(isolated),
-                (root.join(isolated), vec![]),
-                "{isolated}"
-            );
-        }
-    }
-
-    fn macro_evidence(
-        source: &str,
-    ) -> HashMap<String, Vec<(AuthEvidenceKind, String, String, AuthStrength)>> {
-        let syntax: syn::File = syn::parse_str(source).unwrap();
-        collect_authorized_handlers(Path::new("macros.rs"), &syntax)
-            .into_iter()
-            .map(|(handler, evidence)| {
-                let evidence = evidence
-                    .into_iter()
-                    .map(|item| {
-                        assert_eq!(item.handler.as_deref(), Some(handler.as_str()));
-                        (
-                            item.kind,
-                            item.mechanism,
-                            item.symbol.unwrap(),
-                            item.strength,
-                        )
-                    })
-                    .collect();
-                (handler, evidence)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn statement_and_expression_macros_use_the_helper_name_rules() {
-        let evidence = macro_evidence(
-            r#"
-            fn statement() { require_admin!(user); }
-            fn braced() { check_admin! { user } }
-            fn expression() { let allowed = check_permission!(user, "reports:read"); if allowed {} }
-            fn tail() -> bool { has_role!(user, "manager") }
-            fn condition() { if !is_owner!(user, document) { return; } }
-            fn ownership() { ensure_owner!(user, document); }
-            fn authentication() { require_auth!(request); }
-            "#,
-        );
-        use AuthEvidenceKind::*;
-        use AuthStrength::*;
-        let single = |handler: &str| {
-            assert_eq!(evidence[handler].len(), 1, "{handler}");
-            evidence[handler][0].clone()
-        };
-
-        assert_eq!(
-            single("statement"),
-            (
-                RoleCheck,
-                "require_admin".into(),
-                "require_admin!".into(),
-                Strong
-            )
-        );
-        assert_eq!(
-            single("braced"),
-            (
-                RoleCheck,
-                "check_admin".into(),
-                "check_admin!".into(),
-                Strong
-            )
-        );
-        assert_eq!(
-            single("expression"),
-            (
-                PermissionCheck,
-                "check_permission".into(),
-                "check_permission!".into(),
-                Strong
-            )
-        );
-        assert_eq!(
-            single("tail"),
-            (RoleCheck, "has_role".into(), "has_role!".into(), Strong)
-        );
-        assert_eq!(
-            single("condition"),
-            (
-                OwnershipCheck,
-                "is_owner".into(),
-                "is_owner!".into(),
-                Medium
-            )
-        );
-        assert_eq!(
-            single("ownership"),
-            (
-                OwnershipCheck,
-                "ensure_owner".into(),
-                "ensure_owner!".into(),
-                Medium
-            )
-        );
-        assert_eq!(
-            single("authentication"),
-            (
-                IdentityExtraction,
-                "require_auth".into(),
-                "require_auth!".into(),
-                Weak
-            )
-        );
-
-        let syntax: syn::File = syn::parse_str(
-            "fn admin() {\n    log::info!(\"start\");\n    require_admin!(user);\n}",
-        )
-        .unwrap();
-        let line = collect_authorized_handlers(Path::new("macros.rs"), &syntax)["admin"][0].line;
-        assert_eq!(line, 3);
-    }
-
-    #[test]
-    fn logging_formatting_and_unrelated_macros_are_not_evidence() {
-        let evidence = macro_evidence(
-            r#"
-            fn output(user: &str) {
-                println!("admin {}", user);
-                let message = format!("role: {}", user);
-                info!("permission check for {}", user);
-                log::warn!("admin access denied");
-                tracing::debug!(role = "admin");
-                eprintln!("{}", message);
-            }
-            fn assertions(user: &User) {
-                assert!(is_admin(user));
-                debug_assert!(has_role(user, "admin"));
-                assert_eq!(user.role, "admin");
-                let roles = vec![require_admin()];
-            }
-            fn names() {
-                check_admin_log!(user);
-                ensure_admin_exists!(user);
-                role_name!(user);
-                log_permission_check!(user);
-                admin_dashboard!();
-                verify_access_token!(token);
-            }
-            fn definitions() {
-                macro_rules! require_admin { () => { require_admin() }; }
-            }
-            "#,
-        );
-        assert!(evidence.is_empty(), "{evidence:?}");
-    }
-
-    #[test]
-    fn qualified_macro_paths_use_their_last_segment() {
-        let evidence = macro_evidence(
-            r#"
-            fn module() { auth::require_admin!(user); }
-            fn crate_path() { crate::guards::check_permission!(user, "write"); }
-            fn absolute() { ::authz::authorize!(user, action); }
-            fn logging() { guards::admin::info!("checked"); }
-            "#,
-        );
-        use AuthEvidenceKind::*;
-        use AuthStrength::*;
-        assert_eq!(
-            evidence["module"],
-            vec![(
-                RoleCheck,
-                "require_admin".into(),
-                "auth::require_admin!".into(),
-                Strong
-            )]
-        );
-        assert_eq!(
-            evidence["crate_path"],
-            vec![(
-                PermissionCheck,
-                "check_permission".into(),
-                "crate::guards::check_permission!".into(),
-                Strong
-            )]
-        );
-        assert_eq!(
-            evidence["absolute"],
-            vec![(
-                ManualAuthorizationCheck,
-                "authorize".into(),
-                "::authz::authorize!".into(),
-                Strong
-            )]
-        );
-        assert!(!evidence.contains_key("logging"));
-    }
-
-    #[test]
-    fn macro_evidence_stays_with_its_own_handler() {
-        let evidence = route_evidence(
-            r#"
-            async fn outer() {
-                fn nested() { require_admin!(user); }
-                struct Helper;
-                impl Helper { fn check(&self) { check_permission!(user); } }
-                trait Policy { fn verify(&self) { authorize!(user); } }
-                macro_rules! hidden { () => { require_admin!(user) }; }
-            }
-            async fn protected() { require_admin!(user); }
-            async fn sibling() {}
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/admin")
-                    .route("/outer", web::get().to(outer))
-                    .route("/protected", web::get().to(protected))
-                    .route("/sibling", web::get().to(sibling)));
-            }
-            "#,
-        );
-        assert!(
-            evidence["/admin/outer"].is_empty(),
-            "{:?}",
-            evidence["/admin/outer"]
-        );
-        assert_eq!(
-            evidence["/admin/protected"],
-            vec![(AuthEvidenceKind::RoleCheck, "require_admin".to_owned())]
-        );
-        assert!(evidence["/admin/sibling"].is_empty());
-    }
-
-    #[test]
-    fn macro_handler_and_middleware_evidence_are_kept_once_each() {
-        let source = r#"
-            fn check_permission() {}
-            async fn users() {
-                require_admin!(user);
-                check_permission();
-                log::info!("users");
-            }
-            async fn orders() { require_admin!(user); }
-            async fn reports() { require_admin!(user); }
-            async fn payments() { log::info!("payments"); }
-            fn configure(cfg: &mut web::ServiceConfig) {
-                cfg.service(web::scope("/admin")
-                    .route("/users", web::get().guard(RoleGuard).to(users))
-                    .route("/orders", web::get().to(orders))
-                    .route("/reports", web::get().to(reports))
-                    .route("/payments", web::get().to(payments))
-                    .wrap(AuthMiddleware));
-            }
-        "#;
-        let evidence = route_evidence(source);
-        use AuthEvidenceKind::*;
-        let identity = (IdentityExtraction, "AuthMiddleware".to_owned());
-        let role_macro = (RoleCheck, "require_admin".to_owned());
-        assert_eq!(
-            evidence["/admin/users"],
-            vec![
-                (AuthorizationGuard, "RoleGuard".to_owned()),
-                role_macro.clone(),
-                (PermissionCheck, "check_permission".to_owned()),
-                identity.clone(),
-            ]
-        );
-        for path in ["/admin/orders", "/admin/reports"] {
-            assert_eq!(
-                evidence[path],
-                vec![role_macro.clone(), identity.clone()],
-                "{path}"
-            );
-        }
-        assert_eq!(evidence["/admin/payments"], vec![identity]);
-
-        // Macro evidence feeds drift inference like any other handler evidence.
-        let syntax: syn::File = syn::parse_str(source).unwrap();
-        let file = Path::new("scopes.rs");
-        let index = HandlerIndex::single_file(file, &syntax);
-        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
-        visitor.visit_file(&syntax);
-        let (_, _, details, _) = build_analysis_layers(&visitor.routes);
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].suspicious_route.path, "/admin/payments");
-        assert_eq!(details[0].authorized_peer_routes.len(), 3);
-    }
-}
+mod tests;

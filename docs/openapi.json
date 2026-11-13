@@ -1,0 +1,1994 @@
+{
+  "components": {
+    "schemas": {
+      "AnalysisRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "discriminator": {
+              "mapping": {
+                "github": "#/components/schemas/Github",
+                "snapshot": "#/components/schemas/Snapshot"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Snapshot"
+              },
+              {
+                "$ref": "#/components/schemas/Github"
+              }
+            ]
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
+      "AnalysisResult": {
+        "properties": {
+          "analysis_id": {
+            "type": "string"
+          },
+          "arg_url": {
+            "type": "string"
+          },
+          "engine_version": {
+            "type": "string"
+          },
+          "llm_enabled": {
+            "const": false
+          },
+          "privacy": {
+            "$ref": "#/components/schemas/Privacy"
+          },
+          "report": {
+            "$ref": "#/components/schemas/Report"
+          },
+          "schema_version": {
+            "const": "1.0"
+          }
+        },
+        "required": [
+          "schema_version",
+          "analysis_id",
+          "engine_version",
+          "privacy",
+          "report",
+          "arg_url",
+          "llm_enabled"
+        ],
+        "type": "object"
+      },
+      "Assessment": {
+        "properties": {
+          "requirements": {
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "type": "array"
+          },
+          "route": {
+            "$ref": "#/components/schemas/RouteReference"
+          },
+          "uncertainty": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "route",
+          "requirements",
+          "uncertainty"
+        ],
+        "type": "object"
+      },
+      "CheckContrast": {
+        "description": "InformationalCheckContrast: separate from verified drift; insufficient proof for a verified finding.",
+        "properties": {
+          "classification": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string"
+          },
+          "investigation": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "not_verified_reason": {
+            "type": "string"
+          },
+          "observed_difference": {
+            "type": "string"
+          },
+          "related_routes": {
+            "items": {
+              "$ref": "#/components/schemas/RouteReference"
+            },
+            "type": "array"
+          },
+          "relationship_evidence": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "supporting_checks": {
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "type": "array"
+          },
+          "target": {
+            "$ref": "#/components/schemas/RouteReference"
+          },
+          "target_checks": {
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "type": "array"
+          },
+          "target_handler_file": {
+            "type": "string"
+          },
+          "target_handler_line": {
+            "type": "integer"
+          },
+          "target_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "type": "array"
+          },
+          "unresolved_evidence": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "classification",
+          "target",
+          "related_routes",
+          "target_handler_file",
+          "target_handler_line",
+          "target_requirements",
+          "target_checks",
+          "not_verified_reason",
+          "observed_difference",
+          "relationship_evidence",
+          "supporting_checks",
+          "unresolved_evidence",
+          "confidence",
+          "investigation"
+        ],
+        "type": "object"
+      },
+      "Error": {
+        "example": {
+          "error": {
+            "code": "capacity_exceeded",
+            "message": "Analysis capacity is currently full"
+          },
+          "schema_version": "1.0"
+        },
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/PublicError"
+          },
+          "schema_version": {
+            "const": "1.0"
+          }
+        },
+        "required": [
+          "schema_version",
+          "error"
+        ],
+        "type": "object"
+      },
+      "Evidence": {
+        "additionalProperties": true,
+        "description": "Native deterministic analyzer evidence. Free source-derived strings use consistent per-report opaque IDs by default. Structured identifiers and route metadata remain available; this is not raw source.",
+        "type": "object"
+      },
+      "Finding": {
+        "description": "Verified deterministic drift only. Exploratory observations and informational contrasts are separate arrays.",
+        "properties": {
+          "authorized_peer_routes": {
+            "items": {
+              "$ref": "#/components/schemas/RouteReference"
+            },
+            "type": "array"
+          },
+          "category": {
+            "enum": [
+              "MissingEnforcement",
+              "AuthenticationOnlyWithoutAuthorization",
+              "MissingOwnershipValidation",
+              "InconsistentRoleOrPermission",
+              "InconsistentMechanism",
+              "UnresolvedSecurityPosture"
+            ]
+          },
+          "confidence": {
+            "enum": [
+              "High",
+              "Medium",
+              "Low"
+            ]
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "invariant": {
+            "$ref": "#/components/schemas/Invariant"
+          },
+          "peer_group_id": {
+            "type": "string"
+          },
+          "suspicious_route": {
+            "$ref": "#/components/schemas/RouteReference"
+          },
+          "suspicious_route_evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "peer_group_id",
+          "invariant",
+          "suspicious_route",
+          "suspicious_route_evidence",
+          "authorized_peer_routes",
+          "category",
+          "confidence",
+          "explanation"
+        ],
+        "type": "object"
+      },
+      "Github": {
+        "additionalProperties": false,
+        "properties": {
+          "commit": {
+            "pattern": "^[a-fA-F0-9]{40}$",
+            "type": "string"
+          },
+          "type": {
+            "const": "github"
+          },
+          "url": {
+            "description": "HTTPS github.com/owner/repo; repository must be explicitly operator-allowlisted. Public repositories only; no credentials, ports, redirects or query.",
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "url",
+          "commit"
+        ],
+        "type": "object"
+      },
+      "Graph": {
+        "description": "Native ARG topology under a privacy projection. Peer groups, all inferred invariants, exploratory observations and informational contrasts are not exhaustively drawn. Duplicate edges may occur; see docs/arg-visualization.md for the exact semantics.",
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/GraphEdge"
+            },
+            "type": "array"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/GraphNode"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges"
+        ],
+        "type": "object"
+      },
+      "GraphEdge": {
+        "properties": {
+          "from": {
+            "description": "Existing node id in the same graph",
+            "type": "string"
+          },
+          "relation": {
+            "enum": [
+              "BelongsToScope",
+              "RoutesTo",
+              "GuardedBy",
+              "WrappedBy",
+              "EnforcesCheck",
+              "ExtractsIdentity",
+              "ImplementsContract",
+              "ViolatesContract",
+              "FlagsRoute",
+              "UnresolvedEvidence",
+              "PotentialEvidence"
+            ]
+          },
+          "to": {
+            "description": "Existing node id in the same graph",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "relation"
+        ],
+        "type": "object"
+      },
+      "GraphNode": {
+        "properties": {
+          "file": {
+            "description": "Repository-relative source location, if available",
+            "type": "string"
+          },
+          "id": {
+            "description": "Graph-local presentation identity. Do not treat as a file path, URL or cross-analysis identity.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "Scope",
+              "Route",
+              "Handler",
+              "Guard",
+              "Middleware",
+              "AuthorizationCheck",
+              "IdentityExtraction",
+              "InvariantContract",
+              "Finding",
+              "UnresolvedCheck"
+            ]
+          },
+          "label": {
+            "description": "Untrusted display text under the API privacy policy; never HTML.",
+            "type": "string"
+          },
+          "line": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "Health": {
+        "properties": {
+          "capabilities": {
+            "properties": {
+              "github": {
+                "type": "boolean"
+              },
+              "llm_explanations": {
+                "const": false
+              },
+              "snapshot": {
+                "const": true
+              }
+            },
+            "required": [
+              "snapshot",
+              "github",
+              "llm_explanations"
+            ],
+            "type": "object"
+          },
+          "engine_version": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "schema_version": {
+            "const": "1.0"
+          },
+          "status": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "schema_version",
+          "status",
+          "engine_version",
+          "capabilities",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "Invariant": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "evidence_patterns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "peer_group_id": {
+            "type": "string"
+          },
+          "routes_with_authorization": {
+            "type": "integer"
+          },
+          "routes_without_authorization": {
+            "type": "integer"
+          },
+          "strength": {
+            "type": "string"
+          },
+          "total_routes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "peer_group_id",
+          "description",
+          "total_routes",
+          "routes_with_authorization",
+          "routes_without_authorization",
+          "evidence_patterns",
+          "strength"
+        ],
+        "type": "object"
+      },
+      "JobStatus": {
+        "properties": {
+          "arg_url": {
+            "type": "string"
+          },
+          "completed_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "description": "Unix seconds",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PublicError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "description": "Completed jobs expire; pending jobs have null expiry",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "pattern": "^[a-f0-9]{32}$",
+            "type": "string"
+          },
+          "result_url": {
+            "type": "string"
+          },
+          "schema_version": {
+            "const": "1.0"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed",
+              "timed_out"
+            ]
+          },
+          "status_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "id",
+          "status",
+          "created_at",
+          "completed_at",
+          "expires_at",
+          "error",
+          "status_url",
+          "result_url",
+          "arg_url"
+        ],
+        "type": "object"
+      },
+      "Limits": {
+        "properties": {
+          "archive_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "expanded_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "file_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "memory_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "request_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "result_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source_files": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "wall_ms": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_bytes",
+          "source_files",
+          "source_bytes",
+          "file_bytes",
+          "archive_bytes",
+          "expanded_bytes",
+          "result_bytes",
+          "memory_bytes",
+          "wall_ms"
+        ],
+        "type": "object"
+      },
+      "PeerGroup": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/RouteReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "description",
+          "routes"
+        ],
+        "type": "object"
+      },
+      "Privacy": {
+        "properties": {
+          "evidence_text": {
+            "enum": [
+              "redacted",
+              "included"
+            ]
+          },
+          "raw_files_available": {
+            "const": false
+          },
+          "source_paths": {
+            "const": "repository_relative"
+          }
+        },
+        "required": [
+          "evidence_text",
+          "source_paths",
+          "raw_files_available"
+        ],
+        "type": "object"
+      },
+      "PublicError": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Relationship": {
+        "description": "Indices reference report.routes; contract_eligible is independent of authorization evidence.",
+        "properties": {
+          "confidence": {
+            "type": "string"
+          },
+          "conflicts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "contract_eligible": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "evidence_score": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "left": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "right": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "left",
+          "right",
+          "kind",
+          "evidence",
+          "conflicts",
+          "evidence_score",
+          "confidence",
+          "contract_eligible"
+        ],
+        "type": "object"
+      },
+      "Report": {
+        "description": "Native analyzer JSON with a privacy projection only. Candidate relationships are not verified peers. review_observations are exploratory; check_comparisons are informational. Neither counts as a verified finding. Additive evidence fields may appear.",
+        "properties": {
+          "analysis_evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          },
+          "candidate_relationships": {
+            "items": {
+              "$ref": "#/components/schemas/Relationship"
+            },
+            "type": "array"
+          },
+          "check_comparisons": {
+            "items": {
+              "$ref": "#/components/schemas/CheckContrast"
+            },
+            "type": "array"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          },
+          "diff_report": {
+            "$ref": "#/components/schemas/Evidence"
+          },
+          "files_scanned": {
+            "type": "integer"
+          },
+          "finding_details": {
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            },
+            "type": "array"
+          },
+          "findings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "handler_resolution_evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          },
+          "invariants": {
+            "items": {
+              "$ref": "#/components/schemas/Invariant"
+            },
+            "type": "array"
+          },
+          "parse_errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "peer_groups": {
+            "items": {
+              "$ref": "#/components/schemas/PeerGroup"
+            },
+            "type": "array"
+          },
+          "resource_evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          },
+          "review_observations": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewObservation"
+            },
+            "type": "array"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/Route"
+            },
+            "type": "array"
+          },
+          "security_assessments": {
+            "items": {
+              "$ref": "#/components/schemas/Assessment"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/Evidence"
+          }
+        },
+        "required": [
+          "routes",
+          "candidate_relationships",
+          "peer_groups",
+          "invariants",
+          "finding_details",
+          "review_observations",
+          "check_comparisons",
+          "analysis_evidence",
+          "resource_evidence",
+          "handler_resolution_evidence",
+          "security_assessments",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "Requirement": {
+        "properties": {
+          "confidence": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "enforcement": {
+            "type": "string"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "mechanism": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dimension",
+          "values",
+          "mechanism",
+          "enforcement",
+          "confidence",
+          "file",
+          "line",
+          "symbol",
+          "explanation"
+        ],
+        "type": "object"
+      },
+      "ReviewObservation": {
+        "description": "ExploratoryReview: separate from verified drift; insufficient proof for a verified finding.",
+        "properties": {
+          "classification": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "not_verified_reason": {
+            "type": "string"
+          },
+          "observed_difference": {
+            "type": "string"
+          },
+          "related_routes": {
+            "items": {
+              "$ref": "#/components/schemas/RouteReference"
+            },
+            "type": "array"
+          },
+          "relationship_evidence": {
+            "type": "string"
+          },
+          "supporting_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "type": "array"
+          },
+          "target": {
+            "$ref": "#/components/schemas/RouteReference"
+          },
+          "target_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "type": "array"
+          },
+          "unresolved_evidence": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verification_steps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "classification",
+          "target",
+          "related_routes",
+          "dimension",
+          "observed_difference",
+          "relationship_evidence",
+          "supporting_requirements",
+          "target_requirements",
+          "unresolved_evidence",
+          "not_verified_reason",
+          "verification_steps"
+        ],
+        "type": "object"
+      },
+      "Route": {
+        "properties": {
+          "application": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authorization": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          },
+          "file": {
+            "type": "string"
+          },
+          "handler": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handler_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handler_resolution": {
+            "additionalProperties": true,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "line": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "scope_prefix": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "method",
+          "path",
+          "scope_prefix",
+          "handler",
+          "file",
+          "line",
+          "authorization"
+        ],
+        "type": "object"
+      },
+      "RouteReference": {
+        "properties": {
+          "authorization": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array"
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "file": {
+            "type": "string"
+          },
+          "handler": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line": {
+            "type": "integer"
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "status": {
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "Protected",
+                  "Unprotected",
+                  "Unknown"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "method",
+          "path",
+          "handler",
+          "file",
+          "line",
+          "authorized",
+          "authorization",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Snapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/SourceFile"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "type": {
+            "const": "snapshot"
+          }
+        },
+        "required": [
+          "type",
+          "files"
+        ],
+        "type": "object"
+      },
+      "SourceFile": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "path": {
+            "description": "Portable repository-relative Rust source, Cargo.toml or Cargo.lock. No absolute/dot/hidden paths or links.",
+            "maxLength": 240,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "description": "Operator-managed ASCII secret of 32\u2013256 characters. Do not embed in a public frontend bundle.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Single-tenant trusted-client API. Bearer access controls all analyses. Deterministic engine is authoritative; LLM integration is not enabled. Use TLS at a trusted reverse proxy outside loopback. All responses are no-store. Exact-origin CORS is operator configured. See docs/backend.md for limits and isolation boundaries.",
+    "title": "ARCHER analysis API",
+    "version": "1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/analyses": {
+      "post": {
+        "description": "Validate and enqueue source-only analysis. No submitted code is executed. No local server paths accepted. 202 Location identifies the job. Capacity/retention limits return 429; there is no unbounded queue.",
+        "operationId": "submitAnalysis",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "github": {
+                  "value": {
+                    "source": {
+                      "commit": "0123456789abcdef0123456789abcdef01234567",
+                      "type": "github",
+                      "url": "https://github.com/example/project"
+                    }
+                  }
+                },
+                "snapshot": {
+                  "value": {
+                    "source": {
+                      "files": [
+                        {
+                          "content": "fn main() {}",
+                          "path": "src/main.rs"
+                        }
+                      ],
+                      "type": "snapshot"
+                    }
+                  }
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/AnalysisRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            },
+            "description": "JobStatus",
+            "headers": {
+              "Location": {
+                "description": "Relative status URL",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        }
+      }
+    },
+    "/api/v1/analyses/{id}": {
+      "delete": {
+        "description": "Delete a completed job and its retained output. Running jobs return 409; this endpoint does not cancel them.",
+        "operationId": "deleteAnalysis",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-f0-9]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted; no body"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        }
+      },
+      "get": {
+        "description": "Poll status. Missing, deleted and expired jobs return 404. Failure details are sanitized in error; HTTP 200 can represent a failed job.",
+        "operationId": "analysisStatus",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-f0-9]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            },
+            "description": "JobStatus"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        }
+      }
+    },
+    "/api/v1/analyses/{id}/arg": {
+      "get": {
+        "description": "Native ARG as a DOT attachment, not an image. IDs and labels follow the report privacy policy. JSON graph is available in the result report.graph; the Link response header points to that result. No arg.svg endpoint is provided. See docs/arg-visualization.md for the frontend handoff contract.",
+        "operationId": "analysisArg",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-f0-9]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/vnd.graphviz": {
+                "example": "digraph ARG {\n}\n",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Graphviz DOT",
+            "headers": {
+              "Content-Disposition": {
+                "example": "attachment; filename=\"authorization-graph.dot\"",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Security-Policy": {
+                "example": "default-src 'none'; sandbox",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Link": {
+                "description": "Result JSON containing this graph's nodes and edges; exposed to configured CORS origins",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "example": "nosniff",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        }
+      }
+    },
+    "/api/v1/analyses/{id}/result": {
+      "get": {
+        "description": "Completed deterministic report. Pending or failed jobs return 409. Source files are never served.",
+        "operationId": "analysisResult",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-f0-9]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisResult"
+                }
+              }
+            },
+            "description": "AnalysisResult"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "description": "Public readiness/configured capabilities; no credentials, source paths or allowlist disclosed.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "Health"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "description": "This OpenAPI document. Import into standard Swagger tooling; no custom UI is hosted.",
+        "operationId": "openapi",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OpenAPI 3.1 document"
+          }
+        },
+        "security": []
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080"
+    }
+  ]
+}
