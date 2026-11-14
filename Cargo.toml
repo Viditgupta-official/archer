@@ -2,6 +2,7 @@
 name = "archer"
 version = "0.1.0"
 edition = "2024"
+default-run = "archer"
 
 [dependencies]
 anyhow = "1"
@@ -12,3 +13,51 @@ syn = { version = "3.0.4", features = ["full", "visit"] }
 walkdir = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+
+[features]
+default = []
+api = ["dep:actix-web", "dep:tokio", "dep:url", "dep:getrandom", "dep:flate2", "dep:toml", "dep:windows-sys", "dep:libc"]
+
+[[bin]]
+name = "archer-api"
+path = "src/bin/archer-api.rs"
+required-features = ["api"]
+
+[dependencies.actix-web]
+version = "4.19.0"
+default-features = false
+features = ["macros"]
+optional = true
+
+[dependencies.tokio]
+version = "1.54.1"
+features = ["sync", "time"]
+optional = true
+
+[dependencies.url]
+version = "2.5.8"
+optional = true
+
+[dependencies.getrandom]
+version = "0.4.3"
+optional = true
+
+[dependencies.flate2]
+version = "1.1.11"
+optional = true
+
+[dependencies.toml]
+version = "0.9.12"
+default-features = false
+features = ["std", "serde", "parse"]
+optional = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61.2"
+features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"]
+optional = true
+
+[target.'cfg(unix)'.dependencies.libc]
+version = "0.2"
+optional = true

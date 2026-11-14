@@ -1,1 +1,8 @@
 /target/
+/demo/target/
+.venv/
+.env
+__pycache__/
+*.pyc
+*.log
+.DS_Store

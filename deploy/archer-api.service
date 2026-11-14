@@ -1,0 +1,29 @@
+# Linux deployment template: install paths and service account before use.
+# Windows is the verified host; validate this unit and Linux worker limits on target.
+[Unit]
+Description=ARCHER deterministic analysis API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=archer
+Group=archer
+WorkingDirectory=/opt/archer
+ExecStart=/opt/archer/bin/archer-api
+EnvironmentFile=/etc/archer/archer.env
+Environment=ARCHER_WORK_ROOT=/var/lib/archer/work
+StateDirectory=archer
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/archer
+KillMode=control-group
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
