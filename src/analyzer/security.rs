@@ -6,10 +6,24 @@ pub(super) fn known_nonsecurity_constructor(expr: &Expr) -> bool {
     while let Expr::MethodCall(call) = root {
         root = &call.receiver;
     }
-    matches!(root, Expr::Call(call) if matches!(&*call.func, Expr::Path(path) if path.path.segments.iter().any(|s| ["Cors", "Logger", "Compress", "NormalizePath", "DefaultHeaders"].contains(&s.ident.to_string().as_str()))))
+    matches!(root, Expr::Call(call) if matches!(&*call.func, Expr::Path(path) if path.path.segments.iter().any(|s| is_known_nonsecurity_name(&s.ident.to_string()))))
 }
 
-pub(super) fn unknown_middleware(node: &ExprMethodCall, file: &Path) -> Vec<AuthEvidence> {
+/// Names of framework middleware types that shape responses (CORS, logging,
+/// compression, headers, error rendering) and never accept or reject a caller.
+pub(super) fn is_known_nonsecurity_name(name: &str) -> bool {
+    ["Cors", "Logger", "Compress", "NormalizePath", "DefaultHeaders", "ErrorHandlers"].contains(&name)
+}
+
+/// True when a function's declared return type is a known non-security
+/// middleware type, e.g. `fn cors(..) -> Cors`. Typed signatures are a stronger
+/// signal than the function's name.
+pub(super) fn returns_nonsecurity_middleware(sig: &syn::Signature) -> bool {
+    let syn::ReturnType::Type(_, ty) = &sig.output else { return false };
+    matches!(&**ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| is_known_nonsecurity_name(&s.ident.to_string())))
+}
+
+pub(super) fn unknown_middleware(node: &ExprMethodCall, file: &Path, is_known_factory: &dyn Fn(&Expr) -> bool) -> Vec<AuthEvidence> {
     let mut current = node;
     let mut evidence = Vec::new();
     loop {
@@ -34,7 +48,7 @@ pub(super) fn unknown_middleware(node: &ExprMethodCall, file: &Path) -> Vec<Auth
                     ]
                     .contains(&n.as_str())
                 });
-                if route_configuration_name_in_expr(arg).is_none() && !known_nonsecurity {
+                if route_configuration_name_in_expr(arg).is_none() && !known_nonsecurity && !is_known_factory(arg) {
                     evidence.push(AuthEvidence {
                         kind: AuthEvidenceKind::Unknown,
                         mechanism: "UnresolvedMiddleware".into(),

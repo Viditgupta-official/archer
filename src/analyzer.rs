@@ -647,7 +647,7 @@ impl<'a> RouteVisitor<'a> {
             // its opaque middleware here without borrowing sibling arguments.
             for arg in node.args.iter().skip(1) {
                 if let Expr::MethodCall(builder) = arg {
-                    for mut evidence in security::unknown_middleware(builder, &self.file) {
+                    for mut evidence in security::unknown_middleware(builder, &self.file, &|e| self.index.is_nonsecurity_factory(&self.crate_key, &self.module, e)) {
                         evidence.handler = handler.clone();
                         if !authorization.contains(&evidence) {
                             authorization.push(evidence);
@@ -896,7 +896,7 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             let mut evidence = chain_configuration_evidence(node, &self.file);
             if self.conservative_security {
                 evidence.extend(
-                    security::unknown_middleware(node, &self.file)
+                    security::unknown_middleware(node, &self.file, &|e| self.index.is_nonsecurity_factory(&self.crate_key, &self.module, e))
                         .into_iter()
                         .filter(|e| {
                             !e.symbol.as_ref().is_some_and(|name| {
@@ -1530,6 +1530,20 @@ struct HandlerIndex {
 }
 
 impl HandlerIndex {
+    /// A call such as `middlewares::cors(..)` whose function is declared to return
+    /// a known non-security middleware type is not unresolved authorization evidence.
+    fn is_nonsecurity_factory(&self, crate_key: &Path, module: &[String], expr: &Expr) -> bool {
+        let Expr::Call(call) = expr else { return false };
+        let Expr::Path(path) = &*call.func else { return false };
+        let target = HandlerTarget::Path {
+            segments: path.path.segments.iter().map(|s| s.ident.to_string()).collect(),
+            leading_colon: path.path.leading_colon.is_some(),
+        };
+        self.resolve_handler(crate_key, module, &target)
+            .0
+            .is_some_and(|d| security::returns_nonsecurity_middleware(&d.function.sig))
+    }
+
     fn attach_conditional_result_aliases(&mut self) {
         // Model only standard cfg_select's configuration-invariant Result aliases.
         // No feature is selected and no arbitrary macro body is expanded.
@@ -2916,7 +2930,7 @@ fn classify_check_name(name: &str) -> Option<(AuthEvidenceKind, AuthStrength)> {
     // `verify_resource_access`); as a modifier it names authentication artifacts
     // such as `verify_access_token` or logging helpers such as `check_access_log`.
     let ends_with_access = last == "access";
-    let uses_check_prefix = ["require_", "check_", "verify_", "assert_", "ensure_"]
+    let uses_check_prefix = ["require_", "check_", "verify_", "assert_", "ensure_", "validate_"]
         .iter()
         .any(|prefix| lower.starts_with(prefix));
 

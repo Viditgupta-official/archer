@@ -244,7 +244,7 @@ impl RouteVisitor<'_> {
         };
         let mut inherited = chain_configuration_evidence(node, &self.file);
         if self.conservative_security {
-            inherited.extend(security::unknown_middleware(node, &self.file));
+            inherited.extend(security::unknown_middleware(node, &self.file, &|e| self.index.is_nonsecurity_factory(&self.crate_key, &self.module, e)));
         }
         let mut emitted = false;
         for call in calls.iter().rev() {
