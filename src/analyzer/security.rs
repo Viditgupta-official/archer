@@ -1465,6 +1465,7 @@ pub(super) fn assess(
             let mut values = Vec::new();
             let mut observed = false;
             let mut source_predicate=false;
+            let mut method_gate=false;
             let mut unconsumed_predicate=false;
             if let Some(handler) = handler {
                 let mut arguments = CallArguments { symbol: evidence.symbol.as_deref().unwrap_or(""), values: Vec::new() };
@@ -1500,6 +1501,17 @@ pub(super) fn assess(
                     }
                 }
             }
+            if !observed && evidence.is_authorization() {
+                // A method check (`claims.validate_permissions(..)`) cannot be resolved to a
+                // function body, but its result may still directly gate a local rejection.
+                if let (Some(handler), Some(symbol)) = (handler, evidence.symbol.as_deref()) {
+                    if !symbol.contains("::") && method_gates_rejection(index, handler, symbol) {
+                        observed = true;
+                        method_gate = true;
+                        evidence.strength = AuthStrength::Medium;
+                    }
+                }
+            }
             if evidence.is_authorization() && !observed {
                 evidence.kind = AuthEvidenceKind::Unknown;
                 uncertainty.push("Lexical authorization evidence lacks a verified local enforcement path".into());
@@ -1509,7 +1521,7 @@ pub(super) fn assess(
                 enforcement: if observed { Enforcement::Observed } else if evidence.kind == AuthEvidenceKind::Unknown { Enforcement::Unresolved } else { Enforcement::Potential },
                 confidence: if observed { evidence.strength.clone() } else { AuthStrength::Weak }, file: evidence.file.clone(), line: evidence.line,
                 symbol: evidence.symbol.clone().unwrap_or_default(),
-                explanation: if unconsumed_predicate {"Resolved helper requires this source predicate, but its rejection result is not proven to control the handler; this is unresolved enforcement, not a verified missing-check finding".into()} else if source_predicate {"Unconditional consumed helper requires this source-resolved boolean field predicate on every successful return; this does not establish identity provenance or authentication".into()} else if observed { "Local predicate controls a rejection branch, or a local fallible helper propagates rejection".into() } else { "Lexical evidence; acceptance/rejection control flow has not been proven".into() },
+                explanation: if unconsumed_predicate {"Resolved helper requires this source predicate, but its rejection result is not proven to control the handler; this is unresolved enforcement, not a verified missing-check finding".into()} else if source_predicate {"Unconditional consumed helper requires this source-resolved boolean field predicate on every successful return; this does not establish identity provenance or authentication".into()} else if method_gate { "The result of this method call directly selects a rejection branch (`Err(..)`) in the handler body. The method body was not inspected, so what it checks is taken from its name".into() } else if observed { "Local predicate controls a rejection branch, or a local fallible helper propagates rejection".into() } else { "Lexical evidence; acceptance/rejection control flow has not been proven".into() },
             });
         }
         if requirements.iter().any(|r| r.enforcement == Enforcement::Potential) {
@@ -2115,6 +2127,42 @@ fn helper_may_reject(
     })
 }
 
+
+/// True when the handler's top-level statements contain an `if` whose condition is exactly a
+/// call of method `method` (or its negation) and whose rejecting branch ends in `Err(..)`.
+/// Only unconditional top-level statements are considered, so a check nested under another
+/// condition, loop or closure is never treated as a gate on every successful path.
+fn method_gates_rejection(index: &HandlerIndex, handler: &HandlerDefinition, method: &str) -> bool {
+    let context = (handler.crate_key.clone(), handler.module.clone());
+    let is_err = |expr: &Expr| -> bool {
+        let inner = match expr {
+            Expr::Return(ret) => match ret.expr.as_deref() { Some(e) => e, None => return false },
+            other => other,
+        };
+        let Expr::Call(call) = inner else { return false };
+        let Expr::Path(path) = &*call.func else { return false };
+        call.args.len() == 1
+            && matches!(external_path(index, &context, &path.path, 0).as_deref(), Some("Err" | "std::result::Result::Err" | "core::result::Result::Err"))
+            && !code_may_exit(index, handler, &[Stmt::Expr(call.args[0].clone(), None)])
+    };
+    let rejecting = |block: &syn::Block| -> bool {
+        matches!(block.stmts.last(), Some(Stmt::Expr(e, _)) if is_err(e))
+    };
+    let rejecting_expr = |expr: &Expr| -> bool {
+        match expr { Expr::Block(b) => rejecting(&b.block), other => is_err(other) }
+    };
+    handler.function.block.stmts.iter().any(|stmt| {
+        let Stmt::Expr(Expr::If(node), _) = stmt else { return false };
+        let (call, negated) = match &*node.cond {
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => (&*u.expr, true),
+            other => (other, false),
+        };
+        let call = match call { Expr::Paren(p) => &*p.expr, other => other };
+        let Expr::MethodCall(m) = call else { return false };
+        if m.method != method { return false; }
+        if negated { rejecting(&node.then_branch) } else { node.else_branch.as_ref().is_some_and(|(_, other)| rejecting_expr(other)) }
+    })
+}
 
 /// Baseline comparison metadata only. No authorization meaning is assigned to
 /// these local rejection branches, and peer inference never consumes them.

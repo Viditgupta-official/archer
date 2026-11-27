@@ -1533,3 +1533,40 @@ fn app(c: &mut Config) { c.route("/admin", web::get().to(admin)); }
     let route = report.routes.iter().find(|r| r.path == "/admin").unwrap();
     assert!(route.authorization.iter().any(|e| e.mechanism == "validate_permissions"));
 }
+
+fn method_gate_status(body: &str) -> RouteSecurityStatus {
+    let source = format!(
+        "{}\nfn app(c: &mut Config) {{ c.route(\"/x\", web::get().to(handler)); }}\n",
+        body
+    );
+    let repo = TempRepo::new("p2-method-gate", &[("main.rs", source.as_str())]);
+    let report = repo.analyze();
+    report.routes.iter().find(|r| r.path == "/x").unwrap().security_status()
+}
+
+#[test]
+fn method_check_gating_an_err_branch_is_verified() {
+    // positive form: success branch continues, else branch returns Err
+    assert_eq!(
+        method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { if claims.validate_permissions(&need) { Ok(String::new()) } else { Err(forbidden()) } }"),
+        RouteSecurityStatus::Protected
+    );
+    // negated form with an early return
+    assert_eq!(
+        method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { if !claims.validate_permissions(&need) { return Err(forbidden()); } Ok(String::new()) }"),
+        RouteSecurityStatus::Protected
+    );
+}
+
+#[test]
+fn method_check_that_does_not_gate_a_rejection_stays_unverified() {
+    let unknown = |status: RouteSecurityStatus| matches!(status, RouteSecurityStatus::Unknown { .. });
+    // result ignored
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { claims.validate_permissions(&need); Ok(String::new()) }")));
+    // check nested under another condition is not on every successful path
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims, debug: bool) -> Result<String, Error> { if debug { if claims.validate_permissions(&need) { return Ok(String::new()); } else { return Err(forbidden()); } } Ok(String::new()) }")));
+    // else branch does not reject
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { if claims.validate_permissions(&need) { Ok(String::new()) } else { Ok(String::from(\"anyway\")) } }")));
+    // condition is not exactly the call
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims, open: bool) -> Result<String, Error> { if claims.validate_permissions(&need) || open { Ok(String::new()) } else { Err(forbidden()) } }")));
+}
