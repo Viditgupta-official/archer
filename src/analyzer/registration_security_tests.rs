@@ -1493,3 +1493,80 @@ fn app(c:&mut Config) {{c.route("/other",web::get().to(handler).wrap(RoleGuard::
         else {assert!(observed.is_empty(),"{name}: {observed:?}");assert!(matches!(report.routes.iter().find(|r|r.path=="/item").unwrap().security_status(),RouteSecurityStatus::Unknown{..}));}
     }
 }
+
+#[test]
+fn helper_returning_known_nonsecurity_middleware_is_not_unresolved() {
+    let repo = TempRepo::new(
+        "p2-typed-factory",
+        &[(
+            "main.rs",
+            r#"
+fn logger() -> Logger { Logger::default() }
+fn custom_layer() -> SomethingElse { SomethingElse::new() }
+async fn handler() {}
+fn app(c: &mut Config) {
+ c.service(web::scope("/typed").wrap(logger()).route("/item", web::get().to(handler)))
+ .service(web::scope("/opaque").wrap(custom_layer()).route("/item", web::get().to(handler)));
+}
+"#,
+        )],
+    );
+    let report = repo.analyze();
+    let status = |path: &str| report.routes.iter().find(|r| r.path == path).unwrap().security_status();
+    assert_eq!(status("/typed/item"), RouteSecurityStatus::Unprotected);
+    assert!(matches!(status("/opaque/item"), RouteSecurityStatus::Unknown { .. }));
+}
+
+#[test]
+fn validate_prefixed_permission_method_is_recognized() {
+    let repo = TempRepo::new(
+        "p2-validate-permission",
+        &[(
+            "main.rs",
+            r#"
+async fn admin(claims: Claims) { if claims.validate_permissions(&required) {} }
+fn app(c: &mut Config) { c.route("/admin", web::get().to(admin)); }
+"#,
+        )],
+    );
+    let report = repo.analyze();
+    let route = report.routes.iter().find(|r| r.path == "/admin").unwrap();
+    assert!(route.authorization.iter().any(|e| e.mechanism == "validate_permissions"));
+}
+
+fn method_gate_status(body: &str) -> RouteSecurityStatus {
+    let source = format!(
+        "{}\nfn app(c: &mut Config) {{ c.route(\"/x\", web::get().to(handler)); }}\n",
+        body
+    );
+    let repo = TempRepo::new("p2-method-gate", &[("main.rs", source.as_str())]);
+    let report = repo.analyze();
+    report.routes.iter().find(|r| r.path == "/x").unwrap().security_status()
+}
+
+#[test]
+fn method_check_gating_an_err_branch_is_verified() {
+    // positive form: success branch continues, else branch returns Err
+    assert_eq!(
+        method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { if claims.validate_permissions(&need) { Ok(String::new()) } else { Err(forbidden()) } }"),
+        RouteSecurityStatus::Protected
+    );
+    // negated form with an early return
+    assert_eq!(
+        method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { if !claims.validate_permissions(&need) { return Err(forbidden()); } Ok(String::new()) }"),
+        RouteSecurityStatus::Protected
+    );
+}
+
+#[test]
+fn method_check_that_does_not_gate_a_rejection_stays_unverified() {
+    let unknown = |status: RouteSecurityStatus| matches!(status, RouteSecurityStatus::Unknown { .. });
+    // result ignored
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { claims.validate_permissions(&need); Ok(String::new()) }")));
+    // check nested under another condition is not on every successful path
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims, debug: bool) -> Result<String, Error> { if debug { if claims.validate_permissions(&need) { return Ok(String::new()); } else { return Err(forbidden()); } } Ok(String::new()) }")));
+    // else branch does not reject
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims) -> Result<String, Error> { if claims.validate_permissions(&need) { Ok(String::new()) } else { Ok(String::from(\"anyway\")) } }")));
+    // condition is not exactly the call
+    assert!(unknown(method_gate_status("async fn handler(claims: Claims, open: bool) -> Result<String, Error> { if claims.validate_permissions(&need) || open { Ok(String::new()) } else { Err(forbidden()) } }")));
+}
