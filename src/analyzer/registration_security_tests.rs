@@ -180,16 +180,16 @@ fn typed_field_policies_require_mandatory_rejection_and_preserve_differences() {
             "if !p.flags.allowed {Err({return Ok(());denied()})}else{Ok(())}",
             "check_role(&p)?;",
             "",
-            0,
-            0,
+            1,
+            1,
         ),
         (
             "escaping-argument",
             "if !p.flags.allowed {Err(denied())}else{Ok(())}",
             "check_role({return Ok(());&p})?;",
             "",
-            0,
-            0,
+            1,
+            1,
         ),
         (
             "tail",
@@ -228,24 +228,24 @@ fn typed_field_policies_require_mandatory_rejection_and_preserve_differences() {
             "if !p.flags.allowed {Err(denied())}else{Ok(())}",
             "if choose(){check_role(&p)?;}",
             "",
-            0,
-            0,
+            1,
+            1,
         ),
         (
             "opaque-prefix",
             "if !p.flags.allowed {Err(denied())}else{Ok(())}",
             "bypass!();check_role(&p)?;",
             "",
-            0,
-            0,
+            1,
+            1,
         ),
         (
             "early-success",
             "if choose(){return Ok(());} if !p.flags.allowed {Err(denied())}else{Ok(())}",
             "check_role(&p)?;",
             "",
-            0,
-            0,
+            1,
+            1,
         ),
         (
             "compound",
@@ -260,8 +260,8 @@ fn typed_field_policies_require_mandatory_rejection_and_preserve_differences() {
             "if !p.flags.allowed {log_denial();} Ok(())",
             "check_role(&p)?;",
             "",
-            0,
-            0,
+            1,
+            1,
         ),
         (
             "different-policy",
@@ -331,17 +331,27 @@ fn app(){{App::new().route("/one",web::get().to(one)).route("/two",web::get().to
                 .any(|r| r.dimension == "authentication"
                     && r.enforcement == security::Enforcement::Observed)
         );
-        if expected_invariants > 0 {
-            assert!(report.invariants.iter().all(|i| {
-                i.evidence_patterns
-                    .iter()
-                    .all(|p| p.contains("flags.allowed == true"))
-            }));
+        // A verified policy (Medium) must quote the compared source predicate. An unproven or bypassable
+        // helper can only ever yield a Weak, name-only convention, and its finding is never more than
+        // Low confidence and says so in its wording.
+        for invariant in &report.invariants {
+            if invariant.strength == AuthStrength::Weak {
+                assert_eq!(invariant.evidence_patterns, ["check_role"], "{name}");
+            } else {
+                assert!(
+                    invariant.evidence_patterns.iter().all(|p| p.contains("flags.allowed == true")),
+                    "{name}: {invariant:?}"
+                );
+            }
+        }
+        for finding in &report.finding_details {
+            let unverified = finding.invariant.strength == AuthStrength::Weak;
+            assert_eq!(finding.confidence == DriftConfidence::Low, unverified, "{name}");
+            assert_eq!(finding.explanation.contains("unverified convention"), unverified, "{name}");
         }
     }
 }
 
-#[test]
 fn legacy_and_current_targets_keep_configuration_and_mount_context() {
     for (version, adapter) in [("1", "to_async"), ("2", "to"), ("4", "to")] {
         let main = format!(
@@ -1539,7 +1549,11 @@ fn method_gate_status(body: &str) -> RouteSecurityStatus {
         "{}\nfn app(c: &mut Config) {{ c.route(\"/x\", web::get().to(handler)); }}\n",
         body
     );
-    let repo = TempRepo::new("p2-method-gate", &[("main.rs", source.as_str())]);
+    // Tests run in parallel and TempRepo directories are keyed by name and process id, so every
+    // call needs its own name or two tests overwrite each other's source.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let name = format!("p2-method-gate-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let repo = TempRepo::new(&name, &[("main.rs", source.as_str())]);
     let report = repo.analyze();
     report.routes.iter().find(|r| r.path == "/x").unwrap().security_status()
 }

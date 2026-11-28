@@ -1221,7 +1221,10 @@ fn app(cfg: &mut Config) { cfg.route("/records/{id}/archive",web::post().to(arch
 }
 
 #[test]
-fn unrelated_siblings_do_not_inherit_policy_from_mount_alone() {
+fn static_siblings_share_only_an_unverified_convention() {
+    // Routes that only share a mount form a peer group, but nothing verified can be transferred
+    // between them. When the peers' check is name-only, the strongest possible claim is a Weak
+    // invariant and a Low-confidence finding that says the convention is unverified.
     let source = r#"
 async fn one() { check_role("Admin")?; }
 async fn two() { check_role("Admin")?; }
@@ -1229,10 +1232,43 @@ async fn three() { serve(); }
 fn app(cfg: &mut Config) { cfg.route("/api/invoices",web::get().to(one))
 .route("/api/messages",web::get().to(two)).route("/api/weather",web::get().to(three)); }
 "#;
-    let report = TempRepo::new("unrelated-siblings", &[("main.rs", source)]).analyze();
-    assert!(report.peer_groups.is_empty());
-    assert!(report.invariants.is_empty());
-    assert!(report.finding_details.is_empty());
+    let report = TempRepo::new("static-siblings", &[("main.rs", source)]).analyze();
+    assert_eq!(report.peer_groups.len(), 1);
+    assert_eq!(report.invariants.len(), 1);
+    assert_eq!(report.invariants[0].strength, AuthStrength::Weak);
+    assert_eq!(report.finding_details.len(), 1);
+    let finding = &report.finding_details[0];
+    assert_eq!(finding.suspicious_route.path, "/api/weather");
+    assert_eq!(finding.confidence, DriftConfidence::Low);
+    assert!(finding.explanation.contains("unverified convention"), "{}", finding.explanation);
+    assert!(finding.explanation.contains("not confirmed absence"), "{}", finding.explanation);
+    assert!(report
+        .security_assessments
+        .iter()
+        .flat_map(|a| &a.requirements)
+        .all(|r| r.enforcement != security::Enforcement::Observed));
+}
+
+#[test]
+fn sibling_convention_respects_method_and_operational_boundaries() {
+    for (name, third) in [
+        // A different HTTP operation is not a comparable peer.
+        ("method", r#".route("/api/weather",web::post().to(three))"#),
+        // Operational endpoints are public by nature and never pulled into a group.
+        ("health", r#".route("/api/health",web::get().to(three))"#),
+    ] {
+        let source = format!(
+            r#"
+async fn one() {{ check_role("Admin")?; }}
+async fn two() {{ check_role("Admin")?; }}
+async fn three() {{ serve(); }}
+fn app(cfg: &mut Config) {{ cfg.route("/api/invoices",web::get().to(one))
+.route("/api/messages",web::get().to(two)){third}; }}
+"#
+        );
+        let report = TempRepo::new(&format!("sibling-boundary-{name}"), &[("main.rs", &source)]).analyze();
+        assert!(report.finding_details.is_empty(), "{name}: {:?}", report.finding_details);
+    }
 }
 
 #[test]
@@ -2112,11 +2148,24 @@ fn resource_provenance_abstains_for_ambiguous_and_utility_dependencies() {
 
 
 #[test]
-fn promotion_requires_resource_proof_beyond_namespace_or_collection_shape() {
-    for source in [r#"
+fn post_siblings_group_without_evidence_make_no_claim() {
+    // Same-method siblings of one mount are grouped, but with no authorization evidence anywhere
+    // there is nothing to compare: no invariant, finding or review observation may appear.
+    let source = r#"
 async fn public_registration() {} async fn manage_users() {} async fn articles() {}
 fn app(c:&mut Config){c.route("/api/users",web::post().to(public_registration)).route("/api/manage",web::post().to(manage_users)).route("/api/articles",web::post().to(articles));}
-"#, r#"
+"#;
+    let report = TempRepo::new("post-siblings-no-evidence", &[("main.rs", source)]).analyze();
+    assert!(!report.candidate_relationships.is_empty());
+    assert_eq!(report.peer_groups.len(), 1);
+    assert!(report.invariants.is_empty());
+    assert!(report.finding_details.is_empty());
+    assert!(report.review_observations.is_empty());
+}
+
+#[test]
+fn promotion_requires_resource_proof_beyond_namespace_or_collection_shape() {
+    for source in [r#"
 async fn collection() {} async fn item() {}
 fn app(c:&mut Config){c.route("/objects",web::post().to(collection)).route("/objects/{id}",web::get().to(item));}
 "#, r#"

@@ -2174,6 +2174,14 @@ fn membership(r: &Relationship, routes: &[Route]) -> bool {
             && r.evidence
                 .iter()
                 .any(|e| e.starts_with("shared resolved resource:")))
+        // Static siblings of one scope and method are grouped so a repository's own
+        // convention can be compared. Membership transfers no policy; detection still
+        // needs two agreeing peers and a strict majority (see `infer`).
+        || (r.kind == "sibling_operations"
+            && a.method == b.method
+            && a.scope_prefix == b.scope_prefix
+            && !a.path.split('/').any(is_dynamic_segment)
+            && !b.path.split('/').any(is_dynamic_segment))
         || (r.kind == "sibling_operations"
             && a.path.split('/').rev().skip(1).any(is_dynamic_segment)
             && dynamic_segment_shape(a) == dynamic_segment_shape(b))
@@ -2419,6 +2427,7 @@ pub(super) fn infer(
         }
     }
     let mut emitted = HashSet::new();
+    let mut flagged: HashSet<String> = HashSet::new();
     for group in groups {
         let members = members(group, assessments);
         // A shared observation from two members supports a group invariant;
@@ -2603,6 +2612,7 @@ pub(super) fn infer(
                     others.len(),
                     expected.join(", ")
                 );
+                flagged.insert(comparison_key(&target.route));
                 details.push(Finding {
                     peer_group_id: group.id.clone(),
                     // Compatibility: finding evidence counts all authorized members,
@@ -2617,6 +2627,112 @@ pub(super) fn infer(
                 });
                 findings.push(explanation);
             }
+        }
+    }
+    unverified_convention(groups, assessments, &flagged, details, findings, invariants, compared, explanations);
+}
+
+// Evidence that is recognised but whose enforcement could not be verified (for example a
+// helper whose name looks like an authorization check). It is comparable by identity only.
+fn unverified_key(r: &security::Requirement) -> Option<String> {
+    if !matches!(r.dimension.as_str(), "roles" | "permissions" | "ownership")
+        || r.enforcement == Enforcement::Observed
+        || r.symbol.is_empty()
+    {
+        return None;
+    }
+    Some(format!("{}\u{1}{}", r.dimension, r.symbol))
+}
+
+// Lower-confidence companion to the verified-policy comparison. When two or more comparable peers
+// (and a strict majority) carry the same unverified authorization evidence, a route with NO
+// recognised authorization evidence at all is reported as potential drift from the repository's
+// convention. Neither side is claimed to enforce anything: the peers' enforcement is unproven and
+// the target's absence of evidence is not proof of absence.
+#[allow(clippy::too_many_arguments)]
+fn unverified_convention(
+    groups: &[PeerGroup],
+    assessments: &[Assessment],
+    flagged: &HashSet<String>,
+    details: &mut Vec<Finding>,
+    findings: &mut Vec<String>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+    compared: &mut HashSet<String>,
+    explanations: &mut Vec<StageEvidence>,
+) {
+    let mut emitted: HashSet<String> = flagged.clone();
+    for group in groups {
+        let members = members(group, assessments);
+        let Some(first) = members.first() else { continue };
+        if members.iter().any(|a| a.route.scope_prefix != first.route.scope_prefix) {
+            continue;
+        }
+        for target in &members {
+            let key = comparison_key(&target.route);
+            if target.route.status != RouteSecurityStatus::Unprotected
+                || !target.requirements.is_empty()
+                || emitted.contains(&key)
+            {
+                continue;
+            }
+            let others: Vec<_> = members
+                .iter()
+                .copied()
+                .filter(|a| !same_route(&a.route, &target.route))
+                .filter(|a| a.route.method == target.route.method)
+                .filter(|a| path_shape(&a.route.path) == path_shape(&target.route.path))
+                .collect();
+            let mut support: HashMap<String, Vec<&Assessment>> = HashMap::new();
+            for other in &others {
+                let keys: HashSet<_> = other.requirements.iter().filter_map(unverified_key).collect();
+                for k in keys {
+                    support.entry(k).or_default().push(*other);
+                }
+            }
+            let Some((evidence_key, supporters)) = support
+                .into_iter()
+                .filter(|(_, v)| sufficient_support(v.len(), others.len()))
+                .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(&a.0)))
+            else {
+                continue;
+            };
+            let (dimension, symbol) = evidence_key.split_once('\u{1}').unwrap_or(("roles", &evidence_key));
+            let description = format!(
+                "Comparable peers carry {dimension} evidence `{symbol}`, whose enforcement is not verified"
+            );
+            let explanation = format!(
+                "Potential authorization drift (unverified convention): {} {} has no recognized authorization evidence, while {} of {} comparable peers carry `{symbol}`. Archer could not verify that `{symbol}` enforces anything, and absence of recognized evidence is not confirmed absence. Confirm whether this route is intentionally different.",
+                target.route.method, target.route.path, supporters.len(), others.len()
+            );
+            compared.insert(key.clone());
+            emitted.insert(key);
+            let mut contract = invariant(group, &members, description.clone(), &[symbol.to_string()], supporters.len());
+            contract.strength = AuthStrength::Weak;
+            if !invariants.iter().any(|i| i.peer_group_id == contract.peer_group_id && i.description == contract.description) {
+                invariants.push(contract.clone());
+            }
+            explanations.push(StageEvidence::drift(
+                group,
+                target,
+                dimension,
+                "",
+                vec![
+                    format!("{} of {} comparable other peers carry unverified `{symbol}`", supporters.len(), others.len()),
+                    "Unverified convention; peer enforcement was not proven".into(),
+                ],
+            ));
+            details.push(Finding {
+                peer_group_id: group.id.clone(),
+                invariant: contract,
+                suspicious_route: target.route.clone(),
+                suspicious_route_evidence: target.route.authorization.clone(),
+                authorized_peer_routes: supporters.iter().map(|a| a.route.clone()).collect(),
+                category: DriftCategory::MissingEnforcement,
+                confidence: DriftConfidence::Low,
+                explanation: explanation.clone(),
+                remediation: "Confirm whether this route should carry the same check as its peers, and verify what that check enforces.".into(),
+            });
+            findings.push(explanation);
         }
     }
 }
