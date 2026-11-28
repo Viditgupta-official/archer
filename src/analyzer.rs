@@ -24,6 +24,8 @@ pub use reporting::{analyze_repository_diff, build_authorization_graph};
 mod legacy;
 #[cfg(test)]
 use legacy::*;
+#[cfg(test)]
+mod middleware_resolution_tests;
 mod policy_drift;
 #[cfg(test)]
 mod policy_drift_tests;
@@ -1533,6 +1535,97 @@ impl HandlerIndex {
     /// A call such as `middlewares::cors(..)` whose function is declared to return
     /// a known non-security middleware type is not unresolved authorization evidence.
     fn is_nonsecurity_factory(&self, crate_key: &Path, module: &[String], expr: &Expr) -> bool {
+        self.is_external_nonsecurity_middleware(crate_key, module, expr)
+            || self.is_nonrejecting_middleware(crate_key, module, expr)
+            || self.is_nonsecurity_function_factory(crate_key, module, expr)
+    }
+
+    /// `SessionMiddleware::builder(..)..build()` and similar, where the type is imported from a
+    /// library crate known not to accept or reject callers.
+    fn is_external_nonsecurity_middleware(&self, crate_key: &Path, module: &[String], expr: &Expr) -> bool {
+        let mut root = expr;
+        while let Expr::MethodCall(call) = root {
+            root = &call.receiver;
+        }
+        let Expr::Call(call) = root else { return false };
+        let Expr::Path(func) = &*call.func else { return false };
+        if func.path.segments.len() < 2 {
+            return false;
+        }
+        let mut type_path = func.path.clone();
+        type_path.segments.pop();
+        type_path.segments.pop_punct();
+        let context = (crate_key.to_path_buf(), module.to_vec());
+        security::external_path(self, &context, &type_path, 0)
+            .is_some_and(|resolved| security::EXTERNAL_NONSECURITY_MIDDLEWARE.contains(&resolved.as_str()))
+    }
+
+    /// An in-crate middleware such as `TelemetryMiddleware::new(..)` whose `Transform`
+    /// impl yields a service whose `call` only forwards to the inner service. Resolution
+    /// follows the impls (`impl Transform for T`, its `type Transform = X`, then
+    /// `impl Service for X`) and abstains whenever any link is missing or ambiguous.
+    fn is_nonrejecting_middleware(&self, crate_key: &Path, module: &[String], expr: &Expr) -> bool {
+        let mut root = expr;
+        while let Expr::MethodCall(call) = root {
+            root = &call.receiver;
+        }
+        let type_path: Option<(&syn::Path, usize)> = match root {
+            Expr::Call(call) => match &*call.func {
+                Expr::Path(p) if p.path.segments.len() >= 2 => Some((&p.path, p.path.segments.len() - 1)),
+                _ => None,
+            },
+            Expr::Struct(s) => Some((&s.path, s.path.segments.len())),
+            Expr::Path(p) => Some((&p.path, p.path.segments.len())),
+            _ => None,
+        };
+        let Some((path, keep)) = type_path else { return false };
+        let target = UsePath {
+            segments: path.segments.iter().take(keep).map(|s| s.ident.to_string()).collect(),
+            leading_colon: path.leading_colon.is_some(),
+        };
+        let Some(middleware) = self.resolve_module(crate_key, module, &target, 0) else { return false };
+        let self_key = |lexical: &ModuleKey, ty: &syn::Type| -> Option<ModuleKey> {
+            let syn::Type::Path(p) = ty else { return None };
+            let path = UsePath {
+                segments: p.path.segments.iter().map(|s| s.ident.to_string()).collect(),
+                leading_colon: p.path.leading_colon.is_some(),
+            };
+            self.resolve_module(&lexical.0, &lexical.1, &path, 0)
+        };
+        let trait_is = |item: &syn::ItemImpl, name: &str| {
+            item.trait_.as_ref().and_then(|(p, _)| p.segments.last()).is_some_and(|s| s.ident == name)
+        };
+        let transforms: Vec<_> = self
+            .pending_impls
+            .iter()
+            .filter(|(_, lexical, item)| trait_is(item, "Transform") && self_key(lexical, &item.self_ty).as_ref() == Some(&middleware))
+            .collect();
+        let [(_, lexical, transform)] = transforms.as_slice() else { return false };
+        let service_types: Vec<&syn::Type> = transform
+            .items
+            .iter()
+            .filter_map(|member| match member {
+                syn::ImplItem::Type(t) if t.ident == "Transform" => Some(&t.ty),
+                _ => None,
+            })
+            .collect();
+        let [service_type] = service_types.as_slice() else { return false };
+        let Some(service) = self_key(lexical, service_type) else { return false };
+        let calls: Vec<&syn::ImplItemFn> = self
+            .pending_impls
+            .iter()
+            .filter(|(_, lexical, item)| trait_is(item, "Service") && self_key(lexical, &item.self_ty).as_ref() == Some(&service))
+            .flat_map(|(_, _, item)| item.items.iter())
+            .filter_map(|member| match member {
+                syn::ImplItem::Fn(f) if f.sig.ident == "call" => Some(f),
+                _ => None,
+            })
+            .collect();
+        let [call] = calls.as_slice() else { return false };
+        security::call_cannot_reject(call)
+    }
+
+    fn is_nonsecurity_function_factory(&self, crate_key: &Path, module: &[String], expr: &Expr) -> bool {
         let Expr::Call(call) = expr else { return false };
         let Expr::Path(path) = &*call.func else { return false };
         let target = HandlerTarget::Path {
