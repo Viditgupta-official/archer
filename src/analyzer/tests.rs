@@ -1711,9 +1711,19 @@ cfg.service(web::scope(\"/admin\")
     assert_eq!(resolution(payments), &HandlerResolution::GlobImported);
     assert!(payments.authorization.is_empty());
 
-    // These helpers have no available implementation. Resolution alone
-    // must not manufacture an authorization contract or a drift finding.
-    assert!(report.finding_details.is_empty());
+    // These helpers have no available implementation, so resolution cannot prove that they
+    // enforce anything. The repository's own convention (three siblings call them, `payments`
+    // does not) is still reported, but only as a Low-confidence, explicitly unverified finding.
+    assert_eq!(report.finding_details.len(), 1);
+    let finding = &report.finding_details[0];
+    assert_eq!(finding.suspicious_route.path, "/admin/payments");
+    assert_eq!(finding.confidence, DriftConfidence::Low);
+    assert!(finding.explanation.contains("unverified convention"), "{}", finding.explanation);
+    assert!(report
+        .security_assessments
+        .iter()
+        .flat_map(|a| &a.requirements)
+        .all(|r| r.enforcement != security::Enforcement::Observed));
 }
 
 #[test]

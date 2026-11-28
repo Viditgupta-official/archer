@@ -12,7 +12,75 @@ pub(super) fn known_nonsecurity_constructor(expr: &Expr) -> bool {
 /// Names of framework middleware types that shape responses (CORS, logging,
 /// compression, headers, error rendering) and never accept or reject a caller.
 pub(super) fn is_known_nonsecurity_name(name: &str) -> bool {
-    ["Cors", "Logger", "Compress", "NormalizePath", "DefaultHeaders", "ErrorHandlers"].contains(&name)
+    NONSECURITY_MIDDLEWARE.contains(&name)
+}
+
+const NONSECURITY_MIDDLEWARE: [&str; 6] = ["Cors", "Logger", "Compress", "NormalizePath", "DefaultHeaders", "ErrorHandlers"];
+
+/// Library middleware recognised only through an explicit import from the named crate, never by
+/// bare type name, so a custom in-crate `SessionMiddleware` that rejects callers is not swallowed.
+/// `SessionMiddleware`/`IdentityMiddleware` only load session or identity state that handlers
+/// then read, and `TracingLogger` only emits spans; none accepts or rejects a caller itself.
+pub(super) const EXTERNAL_NONSECURITY_MIDDLEWARE: [&str; 3] = [
+    "actix_session::SessionMiddleware",
+    "actix_identity::IdentityMiddleware",
+    "tracing_actix_web::TracingLogger",
+];
+
+/// Proves that an in-crate middleware service's `call` cannot accept or reject a
+/// caller by itself: it forwards the request to the inner service and hands that
+/// service's own outcome back. The check is deliberately syntactic and one-sided; any
+/// early `return`, `?` on something other than an awaited inner future, response or
+/// error construction, unknown macro, or authorization-looking identifier makes it
+/// abstain, and the middleware then stays unresolved evidence.
+pub(super) fn call_cannot_reject(call: &syn::ImplItemFn) -> bool {
+    struct Scan {
+        forwards: bool,
+        clean: bool,
+    }
+    fn suspicious(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        name == "Err"
+            || name.starts_with("Error")
+            || ["HttpResponse", "ServiceResponse", "into_response", "error_response"].contains(&name)
+            || [
+                "auth", "role", "permission", "claim", "token", "jwt", "bearer", "credential",
+                "acl", "guard", "allow", "deny", "forbid", "unauthor", "reject", "block",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+    impl<'ast> Visit<'ast> for Scan {
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.clean = false;
+        }
+        fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+            if !matches!(&*node.expr, Expr::Await(_)) {
+                self.clean = false;
+            }
+            syn::visit::visit_expr_try(self, node);
+        }
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let name = node.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            if !["format", "debug", "info", "warn", "trace", "error", "vec", "matches"].contains(&name.as_str()) {
+                self.clean = false;
+            }
+        }
+        fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+            if suspicious(&ident.to_string()) {
+                self.clean = false;
+            }
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+            if node.method == "call" {
+                self.forwards = true;
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut scan = Scan { forwards: false, clean: true };
+    scan.visit_block(&call.block);
+    scan.clean && scan.forwards
 }
 
 /// True when a function's declared return type is a known non-security
@@ -38,16 +106,7 @@ pub(super) fn unknown_middleware(node: &ExprMethodCall, file: &Path, is_known_fa
                 }
                 let mut names = Names(Vec::new());
                 names.visit_expr(arg);
-                let known_nonsecurity = names.0.iter().any(|n| {
-                    [
-                        "Cors",
-                        "Logger",
-                        "Compress",
-                        "NormalizePath",
-                        "DefaultHeaders",
-                    ]
-                    .contains(&n.as_str())
-                });
+                let known_nonsecurity = names.0.iter().any(|n| is_known_nonsecurity_name(n));
                 if route_configuration_name_in_expr(arg).is_none() && !known_nonsecurity && !is_known_factory(arg) {
                     evidence.push(AuthEvidence {
                         kind: AuthEvidenceKind::Unknown,
@@ -720,6 +779,152 @@ fn validated_block(
         }
     }
     false
+}
+
+/// How an async `FromRequest` extractor, written as `Box::pin(async move { .. })`, rejects callers.
+pub(super) enum ExtractorGate {
+    /// Every success exit follows an unconditional top-level rejection with an Unauthorized-class error.
+    Required(PathBuf, usize),
+    /// Explicit Unauthorized/Forbidden rejection paths exist, but not every success path is shown
+    /// to pass through them.
+    Possible(PathBuf, usize),
+}
+
+const UNAUTHORIZED_ERRORS: [&str; 6] = [
+    "Unauthorized", "Unauthenticated", "NotAuthenticated", "AuthenticationRequired", "ErrorUnauthorized", "ErrorForbidden",
+];
+const FORBIDDEN_ERRORS: [&str; 2] = ["Forbidden", "ErrorForbidden"];
+
+fn mentions_rejection<T: ToTokens>(node: &T) -> bool {
+    node.to_token_stream().into_iter().any(|token| {
+        fn walk(tree: proc_macro2::TokenTree) -> bool {
+            match tree {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    let name = ident.to_string();
+                    UNAUTHORIZED_ERRORS.contains(&name.as_str()) || FORBIDDEN_ERRORS.contains(&name.as_str())
+                }
+                proc_macro2::TokenTree::Group(group) => group.stream().into_iter().any(walk),
+                _ => false,
+            }
+        }
+        walk(token)
+    })
+}
+
+fn is_err_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call(call) if matches!(&*call.func, Expr::Path(p) if p.path.is_ident("Err")))
+}
+
+fn is_ok_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call(call) if matches!(&*call.func, Expr::Path(p) if p.path.is_ident("Ok")))
+}
+
+/// A top-level statement that rejects with an Unauthorized-class error whenever its check fails:
+/// `let x = fallible.map_err(|_| Unauthorized(..))?;`, `... .ok_or_else(|| Unauthorized(..))?;`,
+/// a `let .. else { return Err(Unauthorized..) }`, or `if cond { return Err(Unauthorized..) }`.
+fn rejecting_statement(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Local(local) => local.init.as_ref().is_some_and(|init| {
+            matches!(&*init.expr, Expr::Try(t) if mentions_rejection(&t.expr))
+                || init.diverge.as_ref().is_some_and(|(_, other)| mentions_rejection(other))
+        }),
+        Stmt::Expr(Expr::Try(t), Some(_)) => mentions_rejection(&t.expr),
+        Stmt::Expr(Expr::If(node), _) => {
+            mentions_rejection(&node.then_branch)
+                && matches!(node.then_branch.stmts.last(), Some(Stmt::Expr(Expr::Return(r), _)) if r.expr.as_deref().is_some_and(is_err_call))
+        }
+        _ => false,
+    }
+}
+
+/// True when no code in the block (closures excluded) can finish the future with a success value
+/// other than the block's own tail: an early `return` of anything but `Err(..)`, or an unknown
+/// macro that may expand to one, would let a caller through without passing the gates.
+fn only_tail_succeeds(block: &Block) -> bool {
+    struct Exits(bool);
+    impl<'ast> Visit<'ast> for Exits {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if !node.expr.as_deref().is_some_and(is_err_call) {
+                self.0 = false;
+            }
+            visit::visit_expr_return(self, node);
+        }
+        fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+        fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let name = node.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            if !["format", "debug", "info", "warn", "trace", "error", "vec", "matches"].contains(&name.as_str()) {
+                self.0 = false;
+            }
+        }
+    }
+    let mut exits = Exits(true);
+    exits.visit_block(block);
+    exits.0 && matches!(block.stmts.last(), Some(Stmt::Expr(tail, None)) if is_ok_call(tail))
+}
+
+/// Inspects the one `impl FromRequest for owner` and classifies how its async future rejects.
+/// Abstains (None) when there is no such impl, several, a different shape, or no rejection at all.
+pub(super) fn async_extractor_gate(index: &HandlerIndex, owner: &ModuleKey) -> Option<ExtractorGate> {
+    let mut matches = index.pending_impls.iter().filter(|(_, context, item)| {
+        let Some((path, _)) = &item.trait_ else { return false };
+        if external_path(index, context, path, 0).as_deref() != Some("actix_web::FromRequest") {
+            return false;
+        }
+        let syn::Type::Path(ty) = &*item.self_ty else { return false };
+        let target = UsePath {
+            segments: ty.path.segments.iter().map(|s| s.ident.to_string()).collect(),
+            leading_colon: ty.path.leading_colon.is_some(),
+        };
+        index.resolve_module(&context.0, &context.1, &target, 0).as_ref() == Some(owner)
+    });
+    let (file, _, item) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let method = item.items.iter().find_map(|member| match member {
+        syn::ImplItem::Fn(m) if m.sig.ident == "from_request" => Some(m),
+        _ => None,
+    })?;
+    let line = method.sig.ident.span().start().line;
+    // Leading statements may only bind values; the future is the tail `Box::pin(async move { .. })`.
+    let (tail, leading) = method.block.stmts.split_last()?;
+    if !leading.iter().all(|s| matches!(s, Stmt::Local(_))) {
+        return None;
+    }
+    let Stmt::Expr(Expr::Call(pin), None) = tail else { return None };
+    let Expr::Path(func) = &*pin.func else { return None };
+    let names: Vec<_> = func.path.segments.iter().map(|s| s.ident.to_string()).collect();
+    if names.last().map(String::as_str) != Some("pin") {
+        return None;
+    }
+    let [Expr::Async(future)] = pin.args.iter().collect::<Vec<_>>().as_slice() else { return None };
+    let block = &future.block;
+    if !mentions_rejection(block) {
+        return None;
+    }
+    let gated = block.stmts.iter().any(rejecting_statement);
+    if gated && only_tail_succeeds(block) {
+        Some(ExtractorGate::Required(file.clone(), line))
+    } else {
+        Some(ExtractorGate::Possible(file.clone(), line))
+    }
+}
+
+/// True when `owner` has an `impl FromRequest` in this repository, whatever its shape.
+fn has_local_from_request(index: &HandlerIndex, owner: &ModuleKey) -> bool {
+    index.pending_impls.iter().any(|(_, context, item)| {
+        let Some((path, _)) = &item.trait_ else { return false };
+        if external_path(index, context, path, 0).as_deref() != Some("actix_web::FromRequest") {
+            return false;
+        }
+        let syn::Type::Path(ty) = &*item.self_ty else { return false };
+        let target = UsePath {
+            segments: ty.path.segments.iter().map(|s| s.ident.to_string()).collect(),
+            leading_colon: ty.path.leading_colon.is_some(),
+        };
+        index.resolve_module(&context.0, &context.1, &target, 0).as_ref() == Some(owner)
+    })
 }
 
 fn rejecting_extractor(index: &HandlerIndex, owner: &ModuleKey) -> Option<HandlerDefinition> {
@@ -1545,7 +1750,38 @@ pub(super) fn assess(
                 let target=UsePath{segments:path.path.segments.iter().map(|s|s.ident.to_string()).collect(),leading_colon:path.path.leading_colon.is_some()};
                 // Other wrappers and unresolved aliases do not establish a required extractor.
                 let Some(owner)=index.resolve_module(&handler.crate_key,&handler.module,&target,0).filter(|k|index.record_types.contains(k)) else{continue};
-                let Some(extractor)=extractor_cache.entry(owner.clone()).or_insert_with(||rejecting_extractor(index,&owner)) else{continue};
+                let Some(extractor)=extractor_cache.entry(owner.clone()).or_insert_with(||rejecting_extractor(index,&owner)) else{
+                    // A local `FromRequest` type whose accept/reject behavior is not modeled (for example a
+                    // session or token extractor built on `Box::pin(async move { .. })`) may enforce
+                    // authentication or authorization. Record it instead of silently dropping it, so the
+                    // route is reported as unverified, never as lacking authorization.
+                    if !optional && has_local_from_request(index,&owner) {
+                        let symbol=arg.ty.to_token_stream().to_string();
+                        let line=arg.span().start().line;
+                        // A proven or inspected extractor supersedes the weaker name-based requirement that
+                        // the same parameter already received.
+                        let superseded=|r:&Requirement|r.dimension=="authentication"&&r.mechanism=="extractor"&&r.enforcement==Enforcement::Potential&&r.line==line&&r.symbol==symbol;
+                        let gate=async_extractor_gate(index,&owner);
+                        if gate.is_some() { requirements.retain(|r|!superseded(r)); }
+                        match gate {
+                            Some(ExtractorGate::Required(file,at)) => {
+                                requirements.push(Requirement{dimension:"authentication".into(),values:vec!["authenticated identity".into()],mechanism:"extractor".into(),enforcement:Enforcement::Observed,confidence:AuthStrength::Medium,file:handler.file.clone(),line,symbol:symbol.clone(),explanation:format!("Required extractor rejects with an Unauthorized-class error before it can succeed ({}:{at}); what identity it checks is not modeled",file.display())});
+                                route.authorization.push(AuthEvidence{kind:AuthEvidenceKind::AuthorizationGuard,mechanism:"VerifiedIdentityExtractor".into(),symbol:Some(symbol),file:handler.file.clone(),line,handler:Some(handler.name.clone()),strength:AuthStrength::Medium});
+                            }
+                            Some(ExtractorGate::Possible(file,at)) => {
+                                let explanation=format!("Custom extractor has explicit Unauthorized/Forbidden rejection paths ({}:{at}), but not every success path is shown to pass through them",file.display());
+                                requirements.push(Requirement{dimension:"authentication".into(),values:vec!["authenticated identity".into()],mechanism:"extractor".into(),enforcement:Enforcement::Potential,confidence:AuthStrength::Weak,file:handler.file.clone(),line,symbol:symbol.clone(),explanation:explanation.clone()});
+                                route.authorization.push(AuthEvidence{kind:AuthEvidenceKind::Unknown,mechanism:"UnverifiedIdentityExtractor".into(),symbol:Some(symbol),file:handler.file.clone(),line,handler:Some(handler.name.clone()),strength:AuthStrength::Weak});
+                                uncertainty.push(explanation);
+                            }
+                            None => {
+                                route.authorization.push(AuthEvidence{kind:AuthEvidenceKind::Unknown,mechanism:"UnmodeledExtractor".into(),symbol:Some(symbol.clone()),file:handler.file.clone(),line,handler:Some(handler.name.clone()),strength:AuthStrength::Weak});
+                                requirements.push(Requirement{dimension:"unresolved".into(),values:vec![],mechanism:"custom extractor".into(),enforcement:Enforcement::Unresolved,confidence:AuthStrength::Weak,file:handler.file.clone(),line,symbol,explanation:"Handler takes a custom FromRequest extractor whose accept/reject behavior is not modeled; it may enforce authentication or authorization".into()});
+                            }
+                        }
+                    }
+                    continue;
+                };
                 let observed=!optional && route.authorization.iter().any(|e| e.mechanism=="UnresolvedMiddleware" && *provenance_cache.entry((e.file.clone(),e.line,e.symbol.clone(),owner.clone())).or_insert_with(||middleware_identity(index,e,&owner)));
                 let explanation=if optional {"Optional identity extractor permits absence; it does not establish mandatory authentication".into()} else if observed {format!("Required extractor rejects missing extension ({}:{}); mounted middleware inserts a value derived from verified JWT decoding",extractor.file.display(),extractor.function.sig.ident.span().start().line)} else {format!("Required extractor rejects missing extension ({}:{}), but validated identity production on this mount is unverified",extractor.file.display(),extractor.function.sig.ident.span().start().line)};
                 requirements.push(Requirement{dimension:"authentication".into(),values:vec!["authenticated identity".into()],mechanism:"extractor".into(),enforcement:if observed{Enforcement::Observed}else{Enforcement::Potential},confidence:if observed{AuthStrength::Medium}else{AuthStrength::Weak},file:handler.file.clone(),line:arg.span().start().line,symbol:arg.ty.to_token_stream().to_string(),explanation:explanation.clone()});
